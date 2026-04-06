@@ -19,6 +19,8 @@ TModel = TypeVar("TModel", bound=BaseModel)
 # Carpeta raíz con los PDF originales: se define en configure_source_directory() al ejecutar el script,
 # o con la variable de entorno SUMMARIZER_FILES_DIRECTORY (sin diálogo).
 files_directory: pathlib.Path | None = None
+# PDFs sin capa de texto: si True, se usa el modelo de visión por página; si False, se omiten.
+use_vision_for_scanned_pdfs: bool = False
 summarized_texts = pathlib.Path(__file__).resolve().parent / "summarized_texts"
 summarized_texts.mkdir(parents=True, exist_ok=True)
 completed_texts = pathlib.Path(__file__).resolve().parent / "completed_texts"
@@ -511,6 +513,64 @@ def configure_source_directory() -> None:
     print(f"Carpeta origen: {files_directory}")
 
 
+def configure_vision_extraction_preference() -> None:
+    """
+    Pregunta una sola vez si se deben analizar por imagen los PDF sin texto extraíble (escaneados).
+
+    Override sin diálogo: SUMMARIZER_USE_VISION_OCR=1 / true / yes / sí / si → sí;
+    =0 / false / no → no.
+    """
+    global use_vision_for_scanned_pdfs
+    raw = os.environ.get("SUMMARIZER_USE_VISION_OCR", "").strip().lower()
+    if raw in ("1", "true", "yes", "sí", "si", "y", "on"):
+        use_vision_for_scanned_pdfs = True
+        print(
+            "Extracción por imágenes (PDF escaneados): sí (SUMMARIZER_USE_VISION_OCR)"
+        )
+        return
+    if raw in ("0", "false", "no", "n", "off"):
+        use_vision_for_scanned_pdfs = False
+        print(
+            "Extracción por imágenes (PDF escaneados): no (SUMMARIZER_USE_VISION_OCR)"
+        )
+        return
+
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except ImportError:
+        ans = (
+            input(
+                "¿Analizar PDFs escaneados enviando cada página como imagen al modelo? "
+                "Requiere modelo de visión y es más lento (S/N) [N]: "
+            )
+            .strip()
+            .lower()
+        )
+        use_vision_for_scanned_pdfs = ans in ("s", "sí", "si", "y", "yes")
+        print(
+            f"Extracción por imágenes: {'sí' if use_vision_for_scanned_pdfs else 'no'}"
+        )
+        return
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    use_vision_for_scanned_pdfs = messagebox.askyesno(
+        "Extracción por imágenes",
+        "Algunos PDF no tienen texto seleccionable (escaneados o imágenes).\n\n"
+        "¿Desea analizarlos enviando cada página como imagen al modelo con visión?\n\n"
+        "• Sí: usa la GPU y tarda más.\n"
+        "• No: solo se extrae texto normal; esos archivos quedarán sin contenido hasta que active la opción.",
+        icon="question",
+    )
+    root.destroy()
+    print(
+        f"Extracción por imágenes para PDF sin texto: "
+        f"{'sí' if use_vision_for_scanned_pdfs else 'no'}"
+    )
+
+
 def _nonempty_utf8_file(path: pathlib.Path) -> bool:
     if not path.is_file() or path.stat().st_size == 0:
         return False
@@ -551,10 +611,14 @@ def _extract_single_pdf(src: pathlib.Path) -> None:
         file_text = extract_text_get_text_only(src)
         if file_text.strip():
             write_completed_text(src, file_text)
-        else:
+        elif use_vision_for_scanned_pdfs:
             file_text = pdf_pages_to_vision_text(src)
             if file_text.strip():
                 write_completed_text(src, file_text)
+        else:
+            print(
+                f"Sin texto extraíble (get_text vacío); visión desactivada — omitido: {src}"
+            )
     except Exception as ex:
         print(f"Error processing {src}: {ex}")
 
@@ -678,6 +742,7 @@ def pdf_pages_to_vision_text(pdf_path: pathlib.Path) -> str:
 
 if __name__ == "__main__":
     configure_source_directory()
+    configure_vision_extraction_preference()
     configure_lm_studio_model()
     get_tokenizer()
     run_pdf_extraction()
