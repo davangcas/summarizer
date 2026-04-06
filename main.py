@@ -3,13 +3,15 @@ import os
 import pathlib
 import re
 import threading
+import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, TypeVar
 
 import httpx
 import pymupdf
 from markdown_pdf import MarkdownPdf, Section
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, BadRequestError, OpenAI
 from openai.types.chat import ParsedChatCompletion
 from pydantic import BaseModel, ConfigDict, Field
 from transformers import AutoTokenizer
@@ -34,11 +36,22 @@ LM_STUDIO_HOST = os.environ.get("LM_STUDIO_HOST", "http://localhost:1234").rstri
 
 # Identificador del modelo para chat (se asigna en configure_lm_studio_model).
 completion_model: str = ""
-OUTPUT_TOKEN_RESERVE = 10000
 # Límite de contexto del modelo elegido (tokens); se actualiza al detectar el modelo.
 MAX_CONTEXT_TOKENS: int = 0
 # Input budget por llamada (prompt + documento); salida reservada aparte en el servidor.
 MAX_INPUT_TOKENS: int = 0
+PROMPT_CONTEXT_RATIO_TARGET = float(
+    os.environ.get("SUMMARIZER_PROMPT_CONTEXT_RATIO", "0.40")
+)
+PROMPT_CONTEXT_RATIO_START = float(
+    os.environ.get("SUMMARIZER_PROMPT_CONTEXT_RATIO_START", "0.30")
+)
+PROMPT_CONTEXT_RATIO_MIN = float(
+    os.environ.get("SUMMARIZER_PROMPT_CONTEXT_RATIO_MIN", "0.10")
+)
+PROMPT_CONTEXT_RATIO_STEP = float(
+    os.environ.get("SUMMARIZER_PROMPT_CONTEXT_RATIO_STEP", "0.05")
+)
 
 # Token counting for chunking. Prefer a Gemma tokenizer if you have HF access (see GEMMA_TOKENIZER_ID).
 # Default chain ends with gpt2 (public, no Hugging Face login) so the pipeline works offline.
@@ -60,12 +73,39 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_optional_timeout_seconds(name: str, default: float | None) -> float | None:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"none", "null", "off", "infinite", "inf", "0", "-1"}:
+        return None
+    try:
+        value = float(raw)
+        return None if value <= 0 else value
+    except ValueError:
+        return default
+
+
 # Paralelismo (ajustar si LM Studio/GPU se satura: variables SUMMARIZER_*).
 # Se usa ThreadPoolExecutor; AsyncOpenAI no es necesario salvo que midas cuello de botella distinto.
 MAX_PARALLEL_PDFS = _env_int("SUMMARIZER_MAX_PARALLEL_PDFS", 4)
 MAX_PARALLEL_SUMMARIES = _env_int("SUMMARIZER_MAX_PARALLEL_SUMMARIES", 4)
 MAX_PARALLEL_CHUNKS = _env_int("SUMMARIZER_MAX_PARALLEL_CHUNKS", 4)
+# OCR por imagen: varias páginas en paralelo dentro del mismo PDF (LM Studio suele serializar; subir con precaución).
 MAX_PARALLEL_OCR_PAGES = _env_int("SUMMARIZER_MAX_PARALLEL_OCR_PAGES", 4)
+MAX_PARALLEL_WINDOW_SUMMARIES = _env_int("SUMMARIZER_MAX_PARALLEL_WINDOW_SUMMARIES", 2)
+SUMMARY_PAGE_OVERLAP = _env_int("SUMMARIZER_SUMMARY_PAGE_OVERLAP", 1)
+ASSEMBLE_DEDUP_BORDER = os.environ.get(
+    "SUMMARIZER_ASSEMBLE_DEDUP_BORDER", ""
+).strip().lower() in ("1", "true", "yes", "sí", "si", "on")
+
+REQUEST_TIMEOUT_SECONDS = _env_optional_timeout_seconds(
+    "SUMMARIZER_REQUEST_TIMEOUT_SECONDS", None
+)
+REQUEST_RETRIES = _env_int("SUMMARIZER_REQUEST_RETRIES", 4)
+REQUEST_RETRY_BACKOFF_SECONDS = float(
+    os.environ.get("SUMMARIZER_REQUEST_RETRY_BACKOFF_SECONDS", "2.0")
+)
 
 client = OpenAI(
     base_url=f"{LM_STUDIO_HOST}/v1",
@@ -74,20 +114,21 @@ client = OpenAI(
 
 
 def _effective_context_tokens(model_entry: dict[str, Any]) -> int:
-    """Mayor contexto entre max_context_length y las instancias cargadas."""
-    mx = int(model_entry.get("max_context_length") or 0)
-    best = mx
+    """Contexto real de instancias cargadas (fallback: max_context_length)."""
+    best = 0
     for inst in model_entry.get("loaded_instances") or []:
         cfg = inst.get("config") or {}
         cl = int(cfg.get("context_length") or 0)
         best = max(best, cl)
+    if best <= 0:
+        best = int(model_entry.get("max_context_length") or 0)
     return best
 
 
 def configure_lm_studio_model() -> None:
     """
     Consulta GET {LM_STUDIO_HOST}/api/v1/models y elige un LLM cargado con vision=True
-    y el mayor contexto efectivo. Ajusta MAX_CONTEXT_TOKENS y MAX_INPUT_TOKENS.
+    y el mayor contexto cargado. Ajusta MAX_CONTEXT_TOKENS y MAX_INPUT_TOKENS.
 
     Override: SUMMARIZER_COMPLETION_MODEL + SUMMARIZER_MAX_CONTEXT_TOKENS (sin llamar a la API).
     """
@@ -97,7 +138,9 @@ def configure_lm_studio_model() -> None:
     if manual_model and manual_ctx:
         completion_model = manual_model
         MAX_CONTEXT_TOKENS = max(1024, int(manual_ctx))
-        MAX_INPUT_TOKENS = max(512, MAX_CONTEXT_TOKENS - OUTPUT_TOKEN_RESERVE)
+        MAX_INPUT_TOKENS = max(
+            512, int(MAX_CONTEXT_TOKENS * PROMPT_CONTEXT_RATIO_TARGET)
+        )
         print(
             f"Modelo (override entorno): {completion_model}, contexto {MAX_CONTEXT_TOKENS} tokens"
         )
@@ -148,15 +191,46 @@ def configure_lm_studio_model() -> None:
         )
 
     completion_model, MAX_CONTEXT_TOKENS = best
-    MAX_INPUT_TOKENS = max(512, MAX_CONTEXT_TOKENS - OUTPUT_TOKEN_RESERVE)
+    MAX_INPUT_TOKENS = max(512, int(MAX_CONTEXT_TOKENS * PROMPT_CONTEXT_RATIO_TARGET))
     print(
-        f"Modelo LM Studio (visión, mayor contexto entre cargados): {completion_model} — "
-        f"contexto {MAX_CONTEXT_TOKENS} tokens (entrada útil ~{MAX_INPUT_TOKENS})"
+        f"Modelo LM Studio (visión, mayor contexto cargado): {completion_model} — "
+        f"contexto {MAX_CONTEXT_TOKENS} tokens (límite prompt objetivo "
+        f"{int(PROMPT_CONTEXT_RATIO_TARGET * 100)}% ~{MAX_INPUT_TOKENS})"
     )
 
 
 _tokenizer: AutoTokenizer | None = None
 _tokenizer_lock = threading.Lock()
+_prompt_ratio_lock = threading.Lock()
+_adaptive_prompt_context_ratio: float = max(
+    PROMPT_CONTEXT_RATIO_MIN,
+    min(PROMPT_CONTEXT_RATIO_TARGET, PROMPT_CONTEXT_RATIO_START),
+)
+
+
+def _get_adaptive_prompt_ratio() -> float:
+    with _prompt_ratio_lock:
+        return _adaptive_prompt_context_ratio
+
+
+def _record_prompt_ratio_success() -> float:
+    global _adaptive_prompt_context_ratio
+    with _prompt_ratio_lock:
+        _adaptive_prompt_context_ratio = min(
+            PROMPT_CONTEXT_RATIO_TARGET,
+            _adaptive_prompt_context_ratio + max(0.01, PROMPT_CONTEXT_RATIO_STEP),
+        )
+        return _adaptive_prompt_context_ratio
+
+
+def _record_prompt_ratio_overflow() -> float:
+    global _adaptive_prompt_context_ratio
+    with _prompt_ratio_lock:
+        _adaptive_prompt_context_ratio = max(
+            PROMPT_CONTEXT_RATIO_MIN,
+            _adaptive_prompt_context_ratio - max(0.01, PROMPT_CONTEXT_RATIO_STEP),
+        )
+        return _adaptive_prompt_context_ratio
 
 
 def get_tokenizer() -> AutoTokenizer:
@@ -169,6 +243,8 @@ def get_tokenizer() -> AutoTokenizer:
             for model_id in candidates:
                 try:
                     _tokenizer = AutoTokenizer.from_pretrained(model_id)
+                    # Solo se usa para contar tokens; evita warning de longitudes del modelo base (ej. gpt2=1024).
+                    _tokenizer.model_max_length = 10**9
                     if model_id == "gpt2" and not env_id:
                         print(
                             "Tokenizer: using gpt2 for token counts (public). "
@@ -186,6 +262,58 @@ def get_tokenizer() -> AutoTokenizer:
 def count_tokens(text: str) -> int:
     tok = get_tokenizer()
     return len(tok.encode(text, add_special_tokens=False))
+
+
+# Encabezados de página en completed_texts (extracción nativa y visión).
+_PAGE_HEADER_START_RE = re.compile(r"^## Página (\d+)(?:[^\n]*)?$", re.MULTILINE)
+
+
+def split_markdown_by_page_headers(text: str) -> list[tuple[int, str]]:
+    """Devuelve (número_página, cuerpo) ordenado. Sin marcadores: todo el texto como página 1."""
+    text = text.strip()
+    if not text:
+        return []
+    if not _PAGE_HEADER_START_RE.search(text):
+        return [(1, text)]
+    pieces = re.split(r"(?m)^(?=## Página \d+)", text)
+    out: list[tuple[int, str]] = []
+    header_re = re.compile(r"^## Página (\d+)(?:[^\n]*)?$", re.MULTILINE)
+    for raw in pieces:
+        raw = raw.strip()
+        if not raw:
+            continue
+        first = raw.split("\n", 1)[0].strip()
+        m = header_re.match(first)
+        if not m:
+            continue
+        pn = int(m.group(1))
+        body = header_re.sub("", raw, count=1).strip()
+        out.append((pn, body))
+    return sorted(out, key=lambda x: x[0])
+
+
+def pdf_has_selectable_text(pdf_path: pathlib.Path) -> bool:
+    with pymupdf.open(pdf_path) as pdf:
+        return any(page.get_text().strip() for page in pdf)
+
+
+def _atomic_write_text(path: pathlib.Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _last_page_from_completed_md(content: str) -> int | None:
+    nums = [int(m) for m in _PAGE_HEADER_START_RE.findall(content)]
+    return max(nums) if nums else None
+
+
+def _slugify_anchor(label: str, *, fallback: str) -> str:
+    s = unicodedata.normalize("NFKD", label)
+    s = "".join(c if c.isalnum() or c in " -_" else "" for c in s)
+    s = "-".join(s.lower().split())
+    return s if s else fallback
 
 
 class OCRPageOutput(BaseModel):
@@ -219,14 +347,17 @@ class CornellTopicBlock(BaseModel):
     )
     notes: str = Field(
         description=(
-            "Síntesis de ideas, definiciones, relaciones y datos del tema en prosa clara. "
-            "No pegues párrafos literales del origen. "
-            "Si este bloque proviene de un fragmento y el tema continúa después, indica al final: "
+            "Síntesis académica densa: definiciones, hipótesis, procedimientos, fórmulas (en texto o LaTeX ligero), "
+            "relaciones causa-efecto y condiciones límite del modelo o experimento cuando el original las mencione. "
+            "No pegues párrafos literales extensos. "
+            "Solo si el fragmento termina antes de cerrar el tema y el origen no lo ciere aquí, indica al final: "
             "(continúa en el siguiente fragmento)."
         )
     )
     topic_summary: str = Field(
-        description="Cierre del tema: 2 a 5 frases que integren la idea central y utilidad o aplicación."
+        description=(
+            "Cierre del tema: 2 a 5 frases que integren la idea central, supuestos clave y utilidad en el contexto del texto."
+        )
     )
 
 
@@ -259,8 +390,8 @@ Salida: cumple EXACTAMENTE el esquema JSON indicado (solo claves permitidas; lis
 
 Instrucciones:
 1. Tras el separador --- está el documento fuente. Identifica temas principales y agrupa ideas afines; evita temas duplicados o solapados.
-2. Por tema: título informativo; cues como repaso (preguntas o keywords); notes como síntesis propia (no copiar párrafos extensos); topic_summary para cerrar el tema.
-3. Prioriza hechos y definiciones del texto; no inventes datos, citas o referencias que no aparezcan implícitamente en el material.
+2. Por tema: título informativo; cues como repaso (preguntas o keywords); notes como síntesis densa y utilizable cursando (definiciones, pasos, supuestos, fórmulas cuando existan); topic_summary que cierre con la idea central y utilidad.
+3. Prioriza rigor: hechos, definiciones, datos y razonamiento del texto; no inventes citas, referencias ni detalles inexistentes en el material.
 4. Si el documento mezcla idiomas, sintetiza en español salvo nombres propios o términos técnicos estándar.
 5. No incluyas texto fuera del JSON (sin markdown envolvente, sin comentarios)."""
 
@@ -270,6 +401,18 @@ Qué hacer:
 - Extrae solo los temas que se apoyen en el contenido de ESTE fragmento.
 - Si un tema empieza aquí y seguramente sigue después, en `notes` indica al final: (continúa en el siguiente fragmento).
 - No inventes contenido de otras partes del documento.
+
+---
+{body}"""
+
+SUMMARY_WINDOW_WRAPPER = """Contexto: el texto fuente incluye una o varias secciones consecutivas del PDF marcadas como ## Página N (solo las páginas Pág. {start}–{end} están presentes; no inventes otras páginas).
+
+Qué hacer:
+- Identifica temas usando únicamente el contenido entre esos marcadores.
+- Si varias páginas desarrollan el mismo tema, unifica en un único bloque (un título, cues y notas coherentes).
+- Resalta definiciones, fórmulas, procedimientos, hipótesis y límites que aparezcan en el texto (sin inventar).
+- Si el texto está en otro idioma, sintetiza en español salvo nombres propios y términos técnicos habituales.
+- Evita duplicar el mismo tema cerrado solo porque el marcador de página cambia; en zona solapada con una ventana previa, prioriza información nueva.
 
 ---
 {body}"""
@@ -314,22 +457,255 @@ def completion_parsed_or_validate(
     raise ValueError("El modelo no devolvió contenido parseable")
 
 
+def _chat_parse_with_retry(**kwargs: Any) -> ParsedChatCompletion[Any]:
+    last_error: Exception | None = None
+    for attempt in range(1, REQUEST_RETRIES + 1):
+        try:
+            return client.chat.completions.parse(
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                **kwargs,
+            )
+        except (APITimeoutError, APIConnectionError) as ex:
+            last_error = ex
+            if attempt >= REQUEST_RETRIES:
+                break
+            wait_seconds = REQUEST_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            print(
+                "LM request timeout/conexión; "
+                f"reintento {attempt}/{REQUEST_RETRIES - 1} en {wait_seconds:.1f}s..."
+            )
+            time.sleep(wait_seconds)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Fallo inesperado al ejecutar chat completion")
+
+
+def _is_context_overflow_error(ex: Exception) -> bool:
+    if isinstance(ex, BadRequestError):
+        text = str(ex).lower()
+        return (
+            "context length" in text
+            or "context size has been exceeded" in text
+            or "context size exceeded" in text
+            or "context has been exceeded" in text
+            or "n_keep" in text
+            or "n_ctx" in text
+            or "too many tokens" in text
+        )
+    return False
+
+
+def _format_cornell_topic_markdown(t: CornellTopicBlock, *, slug: str) -> str:
+    cues_md = "\n".join(f"- {c}" for c in t.cues) if t.cues else "-"
+    return (
+        f"### {t.title} {{#{slug}}}\n\n"
+        f"#### Pistas (cue)\n{cues_md}\n\n"
+        f"#### Notas\n{t.notes}\n\n"
+        f"#### Resumen del tema\n{t.topic_summary}"
+    )
+
+
 def format_cornell_markdown(
     summary: CornellSummaryStructured, *, document_title: bool = True
 ) -> str:
     if not summary.topics:
         return ""
     blocks: list[str] = []
-    for t in summary.topics:
-        cues_md = "\n".join(f"- {c}" for c in t.cues) if t.cues else "-"
-        blocks.append(
-            f"## {t.title}\n\n### Pistas (cue)\n{cues_md}\n\n### Notas\n{t.notes}\n\n### Resumen del tema\n{t.topic_summary}"
-        )
+    for i, t in enumerate(summary.topics):
+        slug = _slugify_anchor(t.title, fallback=f"tema-{i + 1}")
+        blocks.append(_format_cornell_topic_markdown(t, slug=slug))
     body = "\n\n".join(blocks)
-    # markdown_pdf → PyMuPDF: la TOC exige que el primer encabezado del documento sea nivel 1 (#).
     if document_title:
         return f"# Resumen\n\n{body}"
     return body
+
+
+def _window_tokens_for_body(
+    start_p: int, end_p: int, body: str, *, overhead_reserve: int
+) -> int:
+    wrapped = SUMMARY_WINDOW_WRAPPER.format(start=start_p, end=end_p, body=body)
+    user_content = f"{SUMMARY_CORNELL_USER_PREFIX}\n\n{wrapped}"
+    return count_tokens(user_content) + overhead_reserve
+
+
+def _summary_window_token_budget() -> int:
+    current_ratio = _get_adaptive_prompt_ratio()
+    return max(512, int(MAX_CONTEXT_TOKENS * current_ratio))
+
+
+def build_page_windows(
+    pages: list[tuple[int, str]],
+    *,
+    overlap: int,
+    budget_tokens: int,
+    strict_one_page: bool,
+) -> list[tuple[int, int, str]]:
+    """Agrupa páginas consecutivas hasta budget_tokens; solape entre ventanas = overlap páginas."""
+    if not pages:
+        return []
+    if strict_one_page:
+        out: list[tuple[int, int, str]] = []
+        for pnum, ptext in pages:
+            out.append(
+                (
+                    pnum,
+                    pnum,
+                    f"## Página {pnum}\n\n{ptext}",
+                )
+            )
+        return out
+
+    n = len(pages)
+    windows: list[tuple[int, int, str]] = []
+    overhead_reserve = 64
+    idx = 0
+    while idx < n:
+        start_p = pages[idx][0]
+        end_idx = idx
+        acc_body = ""
+        while end_idx < n:
+            pnum, ptext = pages[end_idx]
+            sep = "\n\n" if acc_body else ""
+            trial_body = acc_body + sep + f"## Página {pnum}\n\n{ptext}"
+            if (
+                _window_tokens_for_body(
+                    start_p, pnum, trial_body, overhead_reserve=overhead_reserve
+                )
+                > budget_tokens
+            ):
+                break
+            acc_body = trial_body
+            end_idx += 1
+
+        if end_idx == idx:
+            pnum, ptext = pages[idx]
+            inner_overhead = count_tokens(
+                f"{SUMMARY_CORNELL_USER_PREFIX}\n\n"
+                + SUMMARY_WINDOW_WRAPPER.format(start=pnum, end=pnum, body="")
+            )
+            room = max(256, budget_tokens - inner_overhead - overhead_reserve)
+            pieces = chunk_text_by_tokens(ptext, room)
+            for k, piece in enumerate(pieces):
+                label = f"## Página {pnum} (parte {k + 1}/{len(pieces)})\n\n{piece}"
+                windows.append((pnum, pnum, label))
+            idx += 1
+            continue
+
+        end_p = pages[end_idx - 1][0]
+        windows.append((start_p, end_p, acc_body))
+        idx = max(idx + 1, end_idx - max(0, overlap))
+    return windows
+
+
+def _normalize_topic_title(title: str) -> str:
+    return " ".join(title.lower().split())
+
+
+def assemble_cornell_windows_markdown(
+    ordered: list[tuple[int, int, CornellSummaryStructured]],
+) -> str:
+    """Une ventanas en un único Markdown con índice; sin llamadas al modelo."""
+    index_entries: list[tuple[str, str]] = []
+    section_blocks: list[str] = []
+    global_i = 0
+    used_slugs: set[str] = set()
+    last_norm: str | None = None
+
+    for win_i, (start_p, end_p, structured) in enumerate(ordered):
+        if not structured.topics:
+            continue
+        section_inner: list[str] = []
+        win_label = (
+            f"Página {start_p}" if start_p == end_p else f"Páginas {start_p}–{end_p}"
+        )
+        for t in structured.topics:
+            norm = _normalize_topic_title(t.title)
+            if ASSEMBLE_DEDUP_BORDER and last_norm is not None and norm == last_norm:
+                continue
+            last_norm = norm
+            global_i += 1
+            slug = _slugify_anchor(t.title, fallback=f"tema-{global_i}")
+            if slug in used_slugs:
+                slug = f"{slug}-w{win_i}-t{global_i}"
+            used_slugs.add(slug)
+            index_entries.append((t.title, slug))
+            section_inner.append(_format_cornell_topic_markdown(t, slug=slug))
+        if section_inner:
+            section_blocks.append(f"## {win_label}\n\n" + "\n\n".join(section_inner))
+
+    if not index_entries:
+        return ""
+
+    index_lines = "\n".join(f"- [{title}](#{slug})" for title, slug in index_entries)
+    body = "\n\n".join(section_blocks)
+    return f"# Resumen\n\n## Índice\n\n{index_lines}\n\n---\n\n{body}"
+
+
+def _strict_one_page_from_env() -> bool:
+    raw = os.environ.get("SUMMARIZER_SUMMARY_STRICT_ONE_PAGE", "").strip().lower()
+    return raw in ("1", "true", "yes", "sí", "si", "on")
+
+
+def _chat_cornell_window(
+    start_p: int, end_p: int, body: str
+) -> CornellSummaryStructured:
+    wrapped = SUMMARY_WINDOW_WRAPPER.format(start=start_p, end=end_p, body=body)
+    user_content = f"{SUMMARY_CORNELL_USER_PREFIX}\n\n{wrapped}"
+    completion = _chat_parse_with_retry(
+        model=completion_model,
+        messages=[{"role": "user", "content": user_content}],
+        response_format=CornellSummaryStructured,
+    )
+    return completion_parsed_or_validate(completion, CornellSummaryStructured)
+
+
+def summarize_document_paged_windows(full_text: str) -> str:
+    """Resumen Cornell por ventanas de páginas (presupuesto + solape); ensamblado sin modelo."""
+    pages = split_markdown_by_page_headers(full_text)
+    if not pages:
+        return ""
+
+    budget = _summary_window_token_budget()
+    print(
+        f"Resumen por ventanas: {len(pages)} páginas detectadas; "
+        f"presupuesto ~{budget} tokens; solape {SUMMARY_PAGE_OVERLAP} páginas."
+    )
+
+    strict = _strict_one_page_from_env()
+    windows = build_page_windows(
+        pages,
+        overlap=SUMMARY_PAGE_OVERLAP,
+        budget_tokens=budget,
+        strict_one_page=strict,
+    )
+    if not windows:
+        return ""
+
+    def run_window(
+        task_i: int, triplet: tuple[int, int, str]
+    ) -> tuple[int, tuple[int, int, CornellSummaryStructured]]:
+        sp, ep, body = triplet
+        try:
+            structured = _chat_cornell_window(sp, ep, body)
+        except BadRequestError as ex:
+            if _is_context_overflow_error(ex):
+                _record_prompt_ratio_overflow()
+            raise
+        return task_i, (sp, ep, structured)
+
+    workers = min(MAX_PARALLEL_WINDOW_SUMMARIES, len(windows))
+    results: dict[int, tuple[int, int, CornellSummaryStructured]] = {}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futs = [pool.submit(run_window, i, w) for i, w in enumerate(windows)]
+        for fut in as_completed(futs):
+            i, triple = fut.result()
+            results[i] = triple
+
+    ordered_struct = [results[i] for i in range(len(windows))]
+    md = assemble_cornell_windows_markdown(ordered_struct)
+    if md.strip():
+        _record_prompt_ratio_success()
+    return md
 
 
 def ensure_markdown_h1_for_pdf(markdown: str) -> str:
@@ -411,7 +787,7 @@ def chunk_text_by_tokens(body: str, max_content_tokens: int) -> list[str]:
 
 
 def _chat_cornell_structured(user_content: str) -> CornellSummaryStructured:
-    completion = client.chat.completions.parse(
+    completion = _chat_parse_with_retry(
         model=completion_model,
         messages=[{"role": "user", "content": user_content}],
         response_format=CornellSummaryStructured,
@@ -464,12 +840,52 @@ def summarize_cornell_chunked(full_text: str, max_chunk_content_tokens: int) -> 
 def summarize_document(full_text: str) -> str:
     single_user = f"{SUMMARY_CORNELL_USER_PREFIX}\n\n---\n\n{full_text}"
     prompt_tokens = count_tokens(single_user)
-    if prompt_tokens <= MAX_INPUT_TOKENS:
-        return summarize_cornell_single(full_text)
+    current_ratio = _get_adaptive_prompt_ratio()
+    effective_input_budget = max(512, int(MAX_CONTEXT_TOKENS * current_ratio))
+    print(
+        "Presupuesto de prompt (estimado tokenizer local): "
+        f"{prompt_tokens} tokens; límite adaptativo: {effective_input_budget} "
+        f"({int(current_ratio * 100)}% de contexto)"
+    )
+    if prompt_tokens <= effective_input_budget:
+        try:
+            result = summarize_cornell_single(full_text)
+            new_ratio = _record_prompt_ratio_success()
+            print(
+                f"Resumen OK; elevando ratio adaptativo a {int(new_ratio * 100)}% para próximos documentos."
+            )
+            return result
+        except Exception as ex:
+            if not _is_context_overflow_error(ex):
+                raise
+            new_ratio = _record_prompt_ratio_overflow()
+            print(
+                "Overflow de contexto en resumen único; "
+                f"bajando ratio adaptativo a {int(new_ratio * 100)}%."
+            )
 
     wrapper_empty = SUMMARY_CHUNK_WRAPPER.format(part=1, total=1, body="")
     overhead = count_tokens(wrapper_empty)
-    max_chunk_content = max(512, MAX_INPUT_TOKENS - overhead - 200)
+    max_chunk_content = max(512, effective_input_budget - overhead - 200)
+    for _ in range(4):
+        try:
+            result = summarize_cornell_chunked(full_text, max_chunk_content)
+            new_ratio = _record_prompt_ratio_success()
+            print(
+                f"Resumen chunked OK; elevando ratio adaptativo a {int(new_ratio * 100)}%."
+            )
+            return result
+        except Exception as ex:
+            if not _is_context_overflow_error(ex):
+                raise
+            new_ratio = _record_prompt_ratio_overflow()
+            if max_chunk_content <= 512:
+                raise
+            max_chunk_content = max(512, max_chunk_content // 2)
+            print(
+                "Context overflow detectado; reduciendo tamaño de fragmentos a "
+                f"~{max_chunk_content} tokens y ratio adaptativo a {int(new_ratio * 100)}%..."
+            )
     return summarize_cornell_chunked(full_text, max_chunk_content)
 
 
@@ -580,6 +996,17 @@ def _nonempty_utf8_file(path: pathlib.Path) -> bool:
         return False
 
 
+def _completed_md_needs_page_markers(out_md: pathlib.Path) -> bool:
+    """True si hay texto completado pero sin ## Página (extracción antigua)."""
+    if not _nonempty_utf8_file(out_md):
+        return False
+    try:
+        txt = out_md.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return not _PAGE_HEADER_START_RE.search(txt)
+
+
 def _nonempty_pdf_file(path: pathlib.Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
 
@@ -600,21 +1027,101 @@ def write_summary_pdf(md_source_rel: pathlib.Path, summary_md: str) -> None:
     out_pdf = summary_pdfs / md_source_rel.with_suffix(".pdf")
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     pdf = MarkdownPdf()
-    pdf.add_section(Section(text=ensure_markdown_h1_for_pdf(summary_md)))
+    # toc=True: outline en el PDF según # / ## / ### (markdown_pdf → PyMuPDF).
+    pdf.add_section(Section(text=ensure_markdown_h1_for_pdf(summary_md), toc=True))
     pdf.save(out_pdf)
+
+
+def _ocr_page_body_or_empty(src: pathlib.Path, page_index: int) -> str:
+    try:
+        return _ocr_single_page(src, page_index).strip()
+    except Exception as ex:
+        print(f"OCR error página {page_index + 1} de {src}: {ex}")
+        return ""
+
+
+def extract_vision_pdf_incremental(src: pathlib.Path, out_path: pathlib.Path) -> None:
+    """OCR de páginas en paralelo; escribe el .md al avanzar el prefijo consecutivo (atómico, reanudable)."""
+    with pymupdf.open(src) as pdf:
+        n = len(pdf)
+    if n == 0:
+        _atomic_write_text(out_path, "")
+        return
+
+    existing = ""
+    if out_path.is_file():
+        existing = out_path.read_text(encoding="utf-8", errors="replace")
+
+    page_bodies: dict[int, str] = {}
+    chunks_prefix: list[str] = []
+    start_i = 0
+    if existing.strip():
+        if not _PAGE_HEADER_START_RE.search(existing):
+            print(f"OCR reinicio (sin marcadores de página previos): {src.name}")
+            page_bodies.clear()
+            chunks_prefix.clear()
+            start_i = 0
+        else:
+            parsed = split_markdown_by_page_headers(existing)
+            if len(parsed) >= n:
+                print(f"OCR ya completo ({n} páginas): {src.name}")
+                return
+            for pnum, body in parsed:
+                idx = int(pnum) - 1
+                body = body.strip()
+                page_bodies[idx] = body
+                chunks_prefix.append(f"## Página {pnum}\n\n{body}")
+            start_i = len(parsed)
+
+    print(
+        f"OCR vis {src.name}: páginas {start_i + 1}..{n} de {n} "
+        f"(paralelo ≤{MAX_PARALLEL_OCR_PAGES})"
+    )
+    if start_i >= n:
+        _atomic_write_text(out_path, "\n\n".join(chunks_prefix))
+        return
+
+    written_len = start_i
+    write_lock = threading.Lock()
+
+    def try_flush_extended_locked() -> None:
+        nonlocal written_len
+        while written_len < n and written_len in page_bodies:
+            b = page_bodies[written_len]
+            chunks_prefix.append(f"## Página {written_len + 1}\n\n{b}")
+            written_len += 1
+        if chunks_prefix:
+            _atomic_write_text(out_path, "\n\n".join(chunks_prefix))
+
+    pending = [i for i in range(start_i, n) if i not in page_bodies]
+    workers = min(MAX_PARALLEL_OCR_PAGES, len(pending))
+    workers = max(1, workers)
+
+    def run_page(i: int) -> tuple[int, str]:
+        return i, _ocr_page_body_or_empty(src, i)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(run_page, i): i for i in pending}
+        for fut in as_completed(futures):
+            i, text = fut.result()
+            with write_lock:
+                page_bodies[i] = text
+                try_flush_extended_locked()
+
+    with write_lock:
+        try_flush_extended_locked()
 
 
 def _extract_single_pdf(src: pathlib.Path) -> None:
     """Un PDF por tarea (hilo): abre su propio documento; no compartir fitz entre hilos."""
     try:
         print(src)
-        file_text = extract_text_get_text_only(src)
-        if file_text.strip():
+        out_md = completed_md_path_for_pdf(src)
+        if pdf_has_selectable_text(src):
+            file_text = extract_text_get_text_only(src)
             write_completed_text(src, file_text)
         elif use_vision_for_scanned_pdfs:
-            file_text = pdf_pages_to_vision_text(src)
-            if file_text.strip():
-                write_completed_text(src, file_text)
+            extract_vision_pdf_incremental(src, out_md)
         else:
             print(
                 f"Sin texto extraíble (get_text vacío); visión desactivada — omitido: {src}"
@@ -632,9 +1139,14 @@ def run_pdf_extraction() -> None:
             if not file.endswith(".pdf"):
                 continue
             src = pathlib.Path(root) / file
-            if _nonempty_utf8_file(completed_md_path_for_pdf(src)):
+            out_md = completed_md_path_for_pdf(src)
+            if _nonempty_utf8_file(out_md) and not _completed_md_needs_page_markers(
+                out_md
+            ):
                 print(f"Skip extract (already in completed_texts): {src}")
                 continue
+            if _completed_md_needs_page_markers(out_md):
+                print(f"Re-extracción (marcadores de página): {src}")
             pending.append(src)
     if not pending:
         return
@@ -664,7 +1176,7 @@ def _summarize_single_md(md_path: pathlib.Path) -> None:
         full_text = md_path.read_text(encoding="utf-8")
         if not full_text.strip():
             return
-        summary_md = summarize_document(full_text)
+        summary_md = summarize_document_paged_windows(full_text)
         if summary_md.strip():
             write_summary_markdown(rel, summary_md)
             write_summary_pdf(rel, summary_md)
@@ -685,10 +1197,9 @@ def run_summarization_pipeline() -> None:
 def extract_text_get_text_only(pdf_path: pathlib.Path) -> str:
     parts: list[str] = []
     with pymupdf.open(pdf_path) as pdf:
-        for page in pdf:
-            text = page.get_text()
-            if text.strip():
-                parts.append(text)
+        for i, page in enumerate(pdf):
+            text = page.get_text().strip()
+            parts.append(f"## Página {i + 1}\n\n{text}")
     return "\n\n".join(parts)
 
 
@@ -701,7 +1212,7 @@ def _ocr_single_page(pdf_path: pathlib.Path, page_index: int) -> str:
         png_bytes = pix.tobytes("png")
         b64 = base64.standard_b64encode(png_bytes).decode("ascii")
         data_url = f"data:image/png;base64,{b64}"
-        completion = client.chat.completions.parse(
+        completion = _chat_parse_with_retry(
             model=completion_model,
             messages=[
                 {
@@ -718,26 +1229,6 @@ def _ocr_single_page(pdf_path: pathlib.Path, page_index: int) -> str:
             response_format=OCRPageOutput,
         )
         return completion_parsed_or_validate(completion, OCRPageOutput).markdown_text
-
-
-def pdf_pages_to_vision_text(pdf_path: pathlib.Path) -> str:
-    with pymupdf.open(pdf_path) as pdf:
-        n = len(pdf)
-    if n == 0:
-        return ""
-    workers = min(MAX_PARALLEL_OCR_PAGES, n)
-    by_index: dict[int, str] = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_ocr_single_page, pdf_path, i): i for i in range(n)}
-        for fut in as_completed(futures):
-            idx = futures[fut]
-            try:
-                by_index[idx] = fut.result()
-            except Exception as ex:
-                print(f"OCR page {idx} of {pdf_path}: {ex}")
-                by_index[idx] = ""
-    ordered = [by_index[i] for i in range(n)]
-    return "\n\n".join(p for p in ordered if p.strip())
 
 
 if __name__ == "__main__":
