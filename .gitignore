@@ -1,0 +1,7 @@
+/venv
+/__pycache__
+summary_pdfs/
+files/
+completed_texts/
+summarized_texts/
+.ruff_cache/
