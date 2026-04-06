@@ -6,6 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, TypeVar
 
+import httpx
 import pymupdf
 from markdown_pdf import MarkdownPdf, Section
 from openai import OpenAI
@@ -15,7 +16,9 @@ from transformers import AutoTokenizer
 
 TModel = TypeVar("TModel", bound=BaseModel)
 
-files_directory = pathlib.Path(r"D:\Ingenieria Mecatronica").resolve()
+# Carpeta raíz con los PDF originales: se define en configure_source_directory() al ejecutar el script,
+# o con la variable de entorno SUMMARIZER_FILES_DIRECTORY (sin diálogo).
+files_directory: pathlib.Path | None = None
 summarized_texts = pathlib.Path(__file__).resolve().parent / "summarized_texts"
 summarized_texts.mkdir(parents=True, exist_ok=True)
 completed_texts = pathlib.Path(__file__).resolve().parent / "completed_texts"
@@ -23,7 +26,18 @@ completed_texts.mkdir(parents=True, exist_ok=True)
 summary_pdfs = pathlib.Path(__file__).resolve().parent / "summary_pdfs"
 summary_pdfs.mkdir(parents=True, exist_ok=True)
 
-completion_model = "mistralai/ministral-3-3b"
+# LM Studio: http://localhost:1234 — API de listado: GET /api/v1/models
+# (https://lmstudio.ai/docs/developer/rest/list). Se elige LLM cargado con visión y mayor contexto.
+LM_STUDIO_HOST = os.environ.get("LM_STUDIO_HOST", "http://localhost:1234").rstrip("/")
+
+# Identificador del modelo para chat (se asigna en configure_lm_studio_model).
+completion_model: str = ""
+OUTPUT_TOKEN_RESERVE = 10000
+# Límite de contexto del modelo elegido (tokens); se actualiza al detectar el modelo.
+MAX_CONTEXT_TOKENS: int = 0
+# Input budget por llamada (prompt + documento); salida reservada aparte en el servidor.
+MAX_INPUT_TOKENS: int = 0
+
 # Token counting for chunking. Prefer a Gemma tokenizer if you have HF access (see GEMMA_TOKENIZER_ID).
 # Default chain ends with gpt2 (public, no Hugging Face login) so the pipeline works offline.
 _TOKENIZER_FALLBACKS = (
@@ -32,10 +46,6 @@ _TOKENIZER_FALLBACKS = (
     "mistralai/ministral-3-3b",
     "gpt2",
 )
-MAX_CONTEXT_TOKENS = 150000
-OUTPUT_TOKEN_RESERVE = 10000
-# Input budget per API call (prompt + document chunk); output reserved separately by the server.
-MAX_INPUT_TOKENS = MAX_CONTEXT_TOKENS - OUTPUT_TOKEN_RESERVE
 
 
 def _env_int(name: str, default: int) -> int:
@@ -56,9 +66,92 @@ MAX_PARALLEL_CHUNKS = _env_int("SUMMARIZER_MAX_PARALLEL_CHUNKS", 4)
 MAX_PARALLEL_OCR_PAGES = _env_int("SUMMARIZER_MAX_PARALLEL_OCR_PAGES", 4)
 
 client = OpenAI(
-    base_url="http://localhost:1234/v1",
-    api_key="lm-studio",
+    base_url=f"{LM_STUDIO_HOST}/v1",
+    api_key=os.environ.get("LM_API_TOKEN", os.environ.get("LM_API_KEY", "lm-studio")),
 )
+
+
+def _effective_context_tokens(model_entry: dict[str, Any]) -> int:
+    """Mayor contexto entre max_context_length y las instancias cargadas."""
+    mx = int(model_entry.get("max_context_length") or 0)
+    best = mx
+    for inst in model_entry.get("loaded_instances") or []:
+        cfg = inst.get("config") or {}
+        cl = int(cfg.get("context_length") or 0)
+        best = max(best, cl)
+    return best
+
+
+def configure_lm_studio_model() -> None:
+    """
+    Consulta GET {LM_STUDIO_HOST}/api/v1/models y elige un LLM cargado con vision=True
+    y el mayor contexto efectivo. Ajusta MAX_CONTEXT_TOKENS y MAX_INPUT_TOKENS.
+
+    Override: SUMMARIZER_COMPLETION_MODEL + SUMMARIZER_MAX_CONTEXT_TOKENS (sin llamar a la API).
+    """
+    global completion_model, MAX_CONTEXT_TOKENS, MAX_INPUT_TOKENS
+    manual_model = os.environ.get("SUMMARIZER_COMPLETION_MODEL", "").strip()
+    manual_ctx = os.environ.get("SUMMARIZER_MAX_CONTEXT_TOKENS", "").strip()
+    if manual_model and manual_ctx:
+        completion_model = manual_model
+        MAX_CONTEXT_TOKENS = max(1024, int(manual_ctx))
+        MAX_INPUT_TOKENS = max(512, MAX_CONTEXT_TOKENS - OUTPUT_TOKEN_RESERVE)
+        print(
+            f"Modelo (override entorno): {completion_model}, contexto {MAX_CONTEXT_TOKENS} tokens"
+        )
+        return
+
+    url = f"{LM_STUDIO_HOST}/api/v1/models"
+    headers: dict[str, str] = {}
+    token = (
+        os.environ.get("LM_API_TOKEN", "").strip()
+        or os.environ.get("LM_API_KEY", "").strip()
+    )
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        resp = httpx.get(url, headers=headers, timeout=60.0)
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        raise SystemExit(
+            f"No se pudo listar modelos en LM Studio ({url}). ¿Está el servidor activo? {e}"
+        ) from e
+
+    payload = resp.json()
+    models = payload.get("models") or []
+    best: tuple[str, int] | None = None
+
+    for m in models:
+        if m.get("type") != "llm":
+            continue
+        caps = m.get("capabilities") or {}
+        if not caps.get("vision"):
+            continue
+        if not (m.get("loaded_instances") or []):
+            continue
+        key = str(m.get("key") or "").strip()
+        if not key:
+            continue
+        ctx = _effective_context_tokens(m)
+        if ctx <= 0:
+            ctx = 8192
+        if best is None or ctx > best[1]:
+            best = (key, ctx)
+
+    if best is None:
+        raise SystemExit(
+            "No hay ningún LLM cargado en LM Studio con capacidad de visión (capabilities.vision). "
+            "Cargue uno en la app o defina SUMMARIZER_COMPLETION_MODEL y "
+            "SUMMARIZER_MAX_CONTEXT_TOKENS."
+        )
+
+    completion_model, MAX_CONTEXT_TOKENS = best
+    MAX_INPUT_TOKENS = max(512, MAX_CONTEXT_TOKENS - OUTPUT_TOKEN_RESERVE)
+    print(
+        f"Modelo LM Studio (visión, mayor contexto entre cargados): {completion_model} — "
+        f"contexto {MAX_CONTEXT_TOKENS} tokens (entrada útil ~{MAX_INPUT_TOKENS})"
+    )
+
 
 _tokenizer: AutoTokenizer | None = None
 _tokenizer_lock = threading.Lock()
@@ -379,8 +472,43 @@ def summarize_document(full_text: str) -> str:
 
 
 def completed_md_path_for_pdf(src: pathlib.Path) -> pathlib.Path:
+    assert files_directory is not None
     rel = src.relative_to(files_directory)
     return completed_texts / rel.with_suffix(".md")
+
+
+def configure_source_directory() -> None:
+    """Asigna `files_directory` desde la variable de entorno o el diálogo del sistema."""
+    global files_directory
+    env = os.environ.get("SUMMARIZER_FILES_DIRECTORY", "").strip()
+    if env:
+        p = pathlib.Path(env).expanduser().resolve()
+        if not p.is_dir():
+            raise SystemExit(
+                f"SUMMARIZER_FILES_DIRECTORY no es una carpeta válida: {p}"
+            )
+        files_directory = p
+        print(f"Carpeta origen (entorno): {files_directory}")
+        return
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError as e:
+        raise SystemExit(
+            "No se pudo cargar tkinter para elegir carpeta. "
+            "Instale tk o defina SUMMARIZER_FILES_DIRECTORY con la ruta a los PDF."
+        ) from e
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    chosen = filedialog.askdirectory(
+        title="Seleccione la carpeta donde están los archivos PDF originales",
+    )
+    root.destroy()
+    if not chosen:
+        raise SystemExit("No se seleccionó ninguna carpeta.")
+    files_directory = pathlib.Path(chosen).resolve()
+    print(f"Carpeta origen: {files_directory}")
 
 
 def _nonempty_utf8_file(path: pathlib.Path) -> bool:
@@ -423,16 +551,17 @@ def _extract_single_pdf(src: pathlib.Path) -> None:
         file_text = extract_text_get_text_only(src)
         if file_text.strip():
             write_completed_text(src, file_text)
-        # else:
-        #     file_text = pdf_pages_to_vision_text(src)
-        #     if file_text.strip():
-        #         write_completed_text(src, file_text)
+        else:
+            file_text = pdf_pages_to_vision_text(src)
+            if file_text.strip():
+                write_completed_text(src, file_text)
     except Exception as ex:
         print(f"Error processing {src}: {ex}")
 
 
 def run_pdf_extraction() -> None:
     """Idempotent: skips PDFs that already have a non-empty completed_texts .md."""
+    assert files_directory is not None
     pending: list[pathlib.Path] = []
     for root, _, files in os.walk(files_directory):
         for file in files:
@@ -548,6 +677,8 @@ def pdf_pages_to_vision_text(pdf_path: pathlib.Path) -> str:
 
 
 if __name__ == "__main__":
+    configure_source_directory()
+    configure_lm_studio_model()
     get_tokenizer()
     run_pdf_extraction()
     run_summarization_pipeline()
