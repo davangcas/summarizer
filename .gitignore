@@ -5,3 +5,4 @@ files/
 completed_texts/
 summarized_texts/
 .ruff_cache/
+summary_partials/

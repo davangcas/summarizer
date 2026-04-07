@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import json
 import os
 import pathlib
 import re
@@ -29,6 +31,9 @@ completed_texts = pathlib.Path(__file__).resolve().parent / "completed_texts"
 completed_texts.mkdir(parents=True, exist_ok=True)
 summary_pdfs = pathlib.Path(__file__).resolve().parent / "summary_pdfs"
 summary_pdfs.mkdir(parents=True, exist_ok=True)
+# Sub-resúmenes por ventana de páginas (reanudables); una carpeta por documento .md en completed_texts.
+summary_partials = pathlib.Path(__file__).resolve().parent / "summary_partials"
+summary_partials.mkdir(parents=True, exist_ok=True)
 
 # LM Studio: http://localhost:1234 — API de listado: GET /api/v1/models
 # (https://lmstudio.ai/docs/developer/rest/list). Se elige LLM cargado con visión y mayor contexto.
@@ -376,6 +381,82 @@ class CornellSummaryStructured(BaseModel):
     )
 
 
+class _WindowSummaryCheckpoint(BaseModel):
+    """Una ventana ya resumida (archivo en summary_partials)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = 1
+    start_p: int
+    end_p: int
+    body_sha256: str
+    structured: CornellSummaryStructured
+
+
+def _summary_partials_enabled() -> bool:
+    raw = os.environ.get("SUMMARIZER_SUMMARY_PARTIALS", "").strip().lower()
+    if raw in ("0", "false", "no", "n", "off"):
+        return False
+    return True
+
+
+def summary_partials_dir_for_completed_rel(md_source_rel: pathlib.Path) -> pathlib.Path:
+    """Carpeta dedicada al documento: summary_partials/<misma_jerarquía>/<stem>/"""
+    stem = md_source_rel.stem
+    parent = md_source_rel.parent
+    return summary_partials / parent / stem
+
+
+def _window_body_fingerprint(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _atomic_write_json(path: pathlib.Path, obj: BaseModel) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = obj.model_dump_json(indent=2)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(data + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _try_load_window_checkpoint(
+    path: pathlib.Path,
+    *,
+    start_p: int,
+    end_p: int,
+    body: str,
+) -> CornellSummaryStructured | None:
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        ck = _WindowSummaryCheckpoint.model_validate_json(raw)
+    except (OSError, ValueError):
+        return None
+    if ck.start_p != start_p or ck.end_p != end_p:
+        return None
+    if ck.body_sha256 != _window_body_fingerprint(body):
+        return None
+    return ck.structured
+
+
+def _save_window_checkpoint(
+    path: pathlib.Path,
+    *,
+    start_p: int,
+    end_p: int,
+    body: str,
+    structured: CornellSummaryStructured,
+) -> None:
+    ck = _WindowSummaryCheckpoint(
+        start_p=start_p,
+        end_p=end_p,
+        body_sha256=_window_body_fingerprint(body),
+        structured=structured,
+    )
+    _atomic_write_json(path, ck)
+
+
 OCR_PROMPT = """Rol: transcriptor OCR de documentos académicos.
 Tarea: rellena únicamente el campo del esquema con el texto de la imagen.
 
@@ -659,8 +740,18 @@ def _chat_cornell_window(
     return completion_parsed_or_validate(completion, CornellSummaryStructured)
 
 
-def summarize_document_paged_windows(full_text: str) -> str:
-    """Resumen Cornell por ventanas de páginas (presupuesto + solape); ensamblado sin modelo."""
+def summarize_document_paged_windows(
+    full_text: str,
+    *,
+    partials_dir: pathlib.Path | None = None,
+) -> str:
+    """
+    Resumen Cornell por ventanas de páginas (presupuesto + solape); ensamblado sin modelo.
+
+    Si ``partials_dir`` está definido y SUMMARIZER_SUMMARY_PARTIALS no desactiva la función,
+    cada ventana se guarda en ``window_NNNN.json`` (reanudable si el contenido de la ventana
+    no cambia). El Markdown final es el mismo que sin checkpoints.
+    """
     pages = split_markdown_by_page_headers(full_text)
     if not pages:
         return ""
@@ -681,16 +772,53 @@ def summarize_document_paged_windows(full_text: str) -> str:
     if not windows:
         return ""
 
+    use_partials = partials_dir is not None and _summary_partials_enabled()
+    if use_partials:
+        partials_dir.mkdir(parents=True, exist_ok=True)
+        man_path = partials_dir / "_manifest.json"
+        man_tmp = partials_dir / "_manifest.json.tmp"
+        man_tmp.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "page_count": len(pages),
+                    "window_count": len(windows),
+                    "budget_tokens": budget,
+                    "overlap": SUMMARY_PAGE_OVERLAP,
+                    "strict_one_page": strict,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(man_tmp, man_path)
+
     def run_window(
         task_i: int, triplet: tuple[int, int, str]
     ) -> tuple[int, tuple[int, int, CornellSummaryStructured]]:
         sp, ep, body = triplet
+        part_path = (
+            (partials_dir / f"window_{task_i:04d}.json")
+            if use_partials and partials_dir is not None
+            else None
+        )
+        if part_path is not None:
+            cached = _try_load_window_checkpoint(
+                part_path, start_p=sp, end_p=ep, body=body
+            )
+            if cached is not None:
+                return task_i, (sp, ep, cached)
         try:
             structured = _chat_cornell_window(sp, ep, body)
         except BadRequestError as ex:
             if _is_context_overflow_error(ex):
                 _record_prompt_ratio_overflow()
             raise
+        if part_path is not None:
+            _save_window_checkpoint(
+                part_path, start_p=sp, end_p=ep, body=body, structured=structured
+            )
         return task_i, (sp, ep, structured)
 
     workers = min(MAX_PARALLEL_WINDOW_SUMMARIES, len(windows))
@@ -702,10 +830,42 @@ def summarize_document_paged_windows(full_text: str) -> str:
             results[i] = triple
 
     ordered_struct = [results[i] for i in range(len(windows))]
+    # Un solo Markdown agregado (entrada lógica al PDF final).
+    combined_md_path = (
+        (partials_dir / "_combined_windows.md")
+        if use_partials and partials_dir
+        else None
+    )
     md = assemble_cornell_windows_markdown(ordered_struct)
+    if combined_md_path is not None and md.strip():
+        _atomic_write_text(combined_md_path, md)
     if md.strip():
         _record_prompt_ratio_success()
     return md
+
+
+def _markdown_for_pymupdf_pdf(markdown: str) -> str:
+    """
+    Ajusta el Markdown para el pipeline markdown_it → PyMuPDF Story.
+
+    En modo commonmark, los atributos tipo Pandoc ``### Título {#slug}`` no se traducen a
+    ``id=`` en el HTML; el índice manual con ``[texto](#slug)`` sí genera enlaces internos.
+    Story falla luego con: No destination with id=...
+    """
+    text = markdown
+    text = re.sub(
+        r"(?ms)^## Índice\s*\n.*?\n---\s*\n+",
+        "",
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r"^(#{1,6}\s+.+?)\s*\{#([^}]+)\}\s*$",
+        r"\1",
+        text,
+        flags=re.MULTILINE,
+    )
+    return text
 
 
 def ensure_markdown_h1_for_pdf(markdown: str) -> str:
@@ -1028,7 +1188,12 @@ def write_summary_pdf(md_source_rel: pathlib.Path, summary_md: str) -> None:
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     pdf = MarkdownPdf()
     # toc=True: outline en el PDF según # / ## / ### (markdown_pdf → PyMuPDF).
-    pdf.add_section(Section(text=ensure_markdown_h1_for_pdf(summary_md), toc=True))
+    pdf.add_section(
+        Section(
+            text=ensure_markdown_h1_for_pdf(_markdown_for_pymupdf_pdf(summary_md)),
+            toc=True,
+        )
+    )
     pdf.save(out_pdf)
 
 
@@ -1176,7 +1341,8 @@ def _summarize_single_md(md_path: pathlib.Path) -> None:
         full_text = md_path.read_text(encoding="utf-8")
         if not full_text.strip():
             return
-        summary_md = summarize_document_paged_windows(full_text)
+        partials = summary_partials_dir_for_completed_rel(rel)
+        summary_md = summarize_document_paged_windows(full_text, partials_dir=partials)
         if summary_md.strip():
             write_summary_markdown(rel, summary_md)
             write_summary_pdf(rel, summary_md)
