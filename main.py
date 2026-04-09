@@ -4,6 +4,8 @@ import json
 import os
 import pathlib
 import re
+import signal
+import sys
 import threading
 import time
 import unicodedata
@@ -112,10 +114,144 @@ REQUEST_RETRY_BACKOFF_SECONDS = float(
     os.environ.get("SUMMARIZER_REQUEST_RETRY_BACKOFF_SECONDS", "2.0")
 )
 
+MAX_PARALLEL_ONEDRIVE_UPLOADS = max(
+    1, _env_int("SUMMARIZER_MAX_PARALLEL_ONEDRIVE_UPLOADS", 3)
+)
+_ONEDRIVE_UPLOAD_SEM = threading.BoundedSemaphore(MAX_PARALLEL_ONEDRIVE_UPLOADS)
+
 client = OpenAI(
     base_url=f"{LM_STUDIO_HOST}/v1",
     api_key=os.environ.get("LM_API_TOKEN", os.environ.get("LM_API_KEY", "lm-studio")),
 )
+
+_stop_event = threading.Event()
+
+
+class StopRequested(Exception):
+    """Parada cooperativa solicitada por usuario."""
+
+
+def _request_stop(reason: str) -> None:
+    if _stop_event.is_set():
+        return
+    _stop_event.set()
+    print(f"\n[STOP] {reason}")
+
+
+def _check_stop_requested() -> None:
+    if _stop_event.is_set():
+        raise StopRequested("Proceso detenido por solicitud del usuario.")
+
+
+def _sleep_with_stop(total_seconds: float) -> None:
+    deadline = time.monotonic() + max(0.0, total_seconds)
+    while True:
+        _check_stop_requested()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.25, remaining))
+
+
+def _install_stop_handlers() -> None:
+    def _on_sigint(_signum: int, _frame: Any) -> None:
+        _request_stop("SIGINT recibido (Ctrl+C).")
+
+    try:
+        signal.signal(signal.SIGINT, _on_sigint)
+    except Exception:
+        pass
+
+
+def _stop_listener_tty_unix() -> None:
+    """Linux / macOS: tecla sin Enter (cbreak + select)."""
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except (OSError, AttributeError, termios.error):
+        _stop_listener_line()
+        return
+
+    def _char_stops(ch: str) -> bool:
+        return len(ch) == 1 and ch.lower() in ("x", "q", "s")
+
+    try:
+        tty.setcbreak(fd)
+        while not _stop_event.is_set():
+            readable, _, _ = select.select([sys.stdin], [], [], 0.2)
+            if not readable:
+                continue
+            ch = sys.stdin.read(1)
+            if not ch:
+                return
+            if _char_stops(ch):
+                _request_stop("Tecla rápida (x, q o s).")
+                return
+    except (EOFError, OSError, ValueError):
+        return
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except (OSError, termios.error):
+            pass
+
+
+def _stop_listener_tty_windows() -> None:
+    """Windows (consola): tecla sin Enter vía msvcrt."""
+    import msvcrt
+
+    while not _stop_event.is_set():
+        if msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch.lower() in (b"x", b"q", b"s") or ch == b"\x03":
+                _request_stop("Tecla rápida (x, q o s) o Ctrl+C (consola).")
+                return
+        time.sleep(0.05)
+
+
+def _stop_listener_line() -> None:
+    """Sin TTY interactivo: una línea + Enter (p. ej. redirección de stdin)."""
+    print("Control (modo línea): escriba 'stop' (o Enter) y pulse Enter para detener.")
+    while not _stop_event.is_set():
+        try:
+            cmd = input().strip().lower()
+        except EOFError:
+            return
+        except Exception:
+            return
+        if cmd in ("", "stop", "salir", "exit", "quit"):
+            _request_stop("Parada solicitada desde consola.")
+            return
+        print("Comando no reconocido. Use 'stop' (o Enter) para detener.")
+
+
+def _start_stop_listener() -> None:
+    """
+    Hilo daemon para detener el pipeline: tecla rápida si hay consola interactiva.
+
+    - Windows / Linux / macOS (stdin TTY): pulse **x**, **q** o **s** sin Enter.
+    - También **Ctrl+C** (SIGINT) y Ctrl+C en consola Windows (byte 0x03) donde aplique.
+    - Sin TTY: igual que antes, comando por línea + Enter.
+    """
+    print(
+        "Control activo: pulse x, q o s (sin Enter) para detener; "
+        "o Ctrl+C. Sin consola interactiva, use 'stop' + Enter."
+    )
+
+    def _runner() -> None:
+        if sys.stdin.isatty():
+            if os.name == "nt" or sys.platform == "win32":
+                _stop_listener_tty_windows()
+            else:
+                _stop_listener_tty_unix()
+        else:
+            _stop_listener_line()
+
+    threading.Thread(target=_runner, daemon=True, name="stop-listener").start()
 
 
 def _effective_context_tokens(model_entry: dict[str, Any]) -> int:
@@ -342,7 +478,11 @@ class CornellTopicBlock(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: str = Field(
-        description="Nombre breve y descriptivo del tema (sin prefijos meta tipo 'Tema:')."
+        description=(
+            "Nombre del tema alineado con la estructura del documento: capítulo, sección, subtítulo o temática "
+            "cuando el texto las muestre (#/##/###, numeración, títulos destacados). Sin prefijos meta tipo 'Tema:'. "
+            "No uses números de página, rangos ('páginas X–Y'), ni 'fragmento' en el título."
+        )
     )
     cues: list[str] = Field(
         description=(
@@ -373,10 +513,11 @@ class CornellSummaryStructured(BaseModel):
 
     topics: list[CornellTopicBlock] = Field(
         description=(
-            "Temas coherentes del material: cada uno agrupa contenido relacionado. "
-            "Prioriza la estructura lógica del autor (capítulos, unidades) cuando exista. "
+            "Lista ordenada según la secuencia del documento en este fragmento: cada elemento corresponde a una "
+            "temática, sección o subtítulo explícito o implícito del texto (no al orden artificial de ## Página N). "
+            "Unifica en un solo topic lo que el autor trata como la misma sección repartida en varias páginas. "
             "Si el texto es muy breve, un solo tema puede bastar. "
-            "Todo el contenido en español claro salvo términos técnicos habituales en el original."
+            "Todo en español claro salvo términos técnicos habituales en el original."
         )
     )
 
@@ -470,11 +611,12 @@ SUMMARY_CORNELL_USER_PREFIX = """Rol: tutor de estudio y síntesis para textos a
 Salida: cumple EXACTAMENTE el esquema JSON indicado (solo claves permitidas; lista `topics` con objetos title, cues, notes, topic_summary).
 
 Instrucciones:
-1. Tras el separador --- está el documento fuente. Identifica temas principales y agrupa ideas afines; evita temas duplicados o solapados.
-2. Por tema: título informativo; cues como repaso (preguntas o keywords); notes como síntesis densa y utilizable cursando (definiciones, pasos, supuestos, fórmulas cuando existan); topic_summary que cierre con la idea central y utilidad.
-3. Prioriza rigor: hechos, definiciones, datos y razonamiento del texto; no inventes citas, referencias ni detalles inexistentes en el material.
-4. Si el documento mezcla idiomas, sintetiza en español salvo nombres propios o términos técnicos estándar.
-5. No incluyas texto fuera del JSON (sin markdown envolvente, sin comentarios)."""
+1. Tras el separador --- está el documento fuente. Particiona y resume por la estructura discursiva del autor: capítulos, secciones, subtítulos, apartados numerados o temáticas claras (incluidas en encabezados Markdown del propio texto o en negritas/títulos implícitos). Los marcadores `## Página N` solo delimitan el contenido disponible, no son títulos de salida.
+2. En `topics`, ordena los elementos en el mismo orden en que aparecen esas secciones/temáticas en el fragmento. Si la misma sección continúa en varias páginas del bloque, unifica en un único topic.
+3. Por tema: `title` debe reflejar esa sección o temática (adaptado o acortado si hace falta); nunca pongas en `title` números de página, rangos tipo "páginas X–Y", "Pág.", ni metadatos de fragmento. cues como repaso; notes densa (definiciones, pasos, supuestos, fórmulas cuando existan); topic_summary cierra la idea y utilidad.
+4. Prioriza rigor: hechos, definiciones, datos y razonamiento del texto; no inventes citas, referencias ni detalles inexistentes en el material.
+5. Si el documento mezcla idiomas, sintetiza en español salvo nombres propios o términos técnicos estándar.
+6. No incluyas texto fuera del JSON (sin markdown envolvente, sin comentarios)."""
 
 SUMMARY_CHUNK_WRAPPER = """Contexto: este bloque es el fragmento {part} de {total} de un documento largo (no tienes el resto).
 
@@ -486,14 +628,14 @@ Qué hacer:
 ---
 {body}"""
 
-SUMMARY_WINDOW_WRAPPER = """Contexto: el texto fuente incluye una o varias secciones consecutivas del PDF marcadas como ## Página N (solo las páginas Pág. {start}–{end} están presentes; no inventes otras páginas).
+SUMMARY_WINDOW_WRAPPER = """Contexto: el bloque siguiente contiene el texto de las páginas {start}–{end} del PDF original, separadas por marcadores `## Página N`. Eso es solo delimitación de contexto (no repitas ni uses esos rangos o números de página en los campos `title` del JSON).
 
 Qué hacer:
-- Identifica temas usando únicamente el contenido entre esos marcadores.
-- Si varias páginas desarrollan el mismo tema, unifica en un único bloque (un título, cues y notas coherentes).
+- Extrae `topics` siguiendo títulos, subtítulos, secciones y temáticas del propio contenido (no una lista por página).
+- Si la misma sección continúa en varias páginas dentro de este bloque, unifica en un solo `topic` con un único `title`.
 - Resalta definiciones, fórmulas, procedimientos, hipótesis y límites que aparezcan en el texto (sin inventar).
 - Si el texto está en otro idioma, sintetiza en español salvo nombres propios y términos técnicos habituales.
-- Evita duplicar el mismo tema cerrado solo porque el marcador de página cambia; en zona solapada con una ventana previa, prioriza información nueva.
+- Evita duplicar el mismo tema cerrado solo porque cambia el marcador `## Página`; en solape con otra ventana, prioriza información nueva sin repetir el mismo `title` si el contenido es redundante.
 
 ---
 {body}"""
@@ -541,6 +683,7 @@ def completion_parsed_or_validate(
 def _chat_parse_with_retry(**kwargs: Any) -> ParsedChatCompletion[Any]:
     last_error: Exception | None = None
     for attempt in range(1, REQUEST_RETRIES + 1):
+        _check_stop_requested()
         try:
             return client.chat.completions.parse(
                 timeout=REQUEST_TIMEOUT_SECONDS,
@@ -555,7 +698,7 @@ def _chat_parse_with_retry(**kwargs: Any) -> ParsedChatCompletion[Any]:
                 "LM request timeout/conexión; "
                 f"reintento {attempt}/{REQUEST_RETRIES - 1} en {wait_seconds:.1f}s..."
             )
-            time.sleep(wait_seconds)
+            _sleep_with_stop(wait_seconds)
     if last_error is not None:
         raise last_error
     raise RuntimeError("Fallo inesperado al ejecutar chat completion")
@@ -685,20 +828,16 @@ def _normalize_topic_title(title: str) -> str:
 def assemble_cornell_windows_markdown(
     ordered: list[tuple[int, int, CornellSummaryStructured]],
 ) -> str:
-    """Une ventanas en un único Markdown con índice; sin llamadas al modelo."""
+    """Une ventanas en un único Markdown con índice; temas Cornell seguidos sin agrupar por rango de páginas."""
     index_entries: list[tuple[str, str]] = []
-    section_blocks: list[str] = []
+    topic_blocks: list[str] = []
     global_i = 0
     used_slugs: set[str] = set()
     last_norm: str | None = None
 
-    for win_i, (start_p, end_p, structured) in enumerate(ordered):
+    for win_i, (_start_p, _end_p, structured) in enumerate(ordered):
         if not structured.topics:
             continue
-        section_inner: list[str] = []
-        win_label = (
-            f"Página {start_p}" if start_p == end_p else f"Páginas {start_p}–{end_p}"
-        )
         for t in structured.topics:
             norm = _normalize_topic_title(t.title)
             if ASSEMBLE_DEDUP_BORDER and last_norm is not None and norm == last_norm:
@@ -710,15 +849,13 @@ def assemble_cornell_windows_markdown(
                 slug = f"{slug}-w{win_i}-t{global_i}"
             used_slugs.add(slug)
             index_entries.append((t.title, slug))
-            section_inner.append(_format_cornell_topic_markdown(t, slug=slug))
-        if section_inner:
-            section_blocks.append(f"## {win_label}\n\n" + "\n\n".join(section_inner))
+            topic_blocks.append(_format_cornell_topic_markdown(t, slug=slug))
 
     if not index_entries:
         return ""
 
     index_lines = "\n".join(f"- [{title}](#{slug})" for title, slug in index_entries)
-    body = "\n\n".join(section_blocks)
+    body = "\n\n".join(topic_blocks)
     return f"# Resumen\n\n## Índice\n\n{index_lines}\n\n---\n\n{body}"
 
 
@@ -755,6 +892,7 @@ def summarize_document_paged_windows(
     pages = split_markdown_by_page_headers(full_text)
     if not pages:
         return ""
+    _check_stop_requested()
 
     budget = _summary_window_token_budget()
     print(
@@ -797,6 +935,7 @@ def summarize_document_paged_windows(
     def run_window(
         task_i: int, triplet: tuple[int, int, str]
     ) -> tuple[int, tuple[int, int, CornellSummaryStructured]]:
+        _check_stop_requested()
         sp, ep, body = triplet
         part_path = (
             (partials_dir / f"window_{task_i:04d}.json")
@@ -826,6 +965,7 @@ def summarize_document_paged_windows(
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futs = [pool.submit(run_window, i, w) for i, w in enumerate(windows)]
         for fut in as_completed(futs):
+            _check_stop_requested()
             i, triple = fut.result()
             results[i] = triple
 
@@ -881,6 +1021,46 @@ def ensure_markdown_h1_for_pdf(markdown: str) -> str:
             return markdown
         break
     return f"# Resumen\n\n{text}"
+
+
+_HEADING_LINE_RE = re.compile(r"^(#{1,6})(\s+.*)$")
+
+
+def normalize_markdown_heading_hierarchy_for_pdf(markdown: str) -> str:
+    """
+    PyMuPDF set_toc exige que los niveles del índice no salten (p. ej. h1 → h3),
+    lo que provoca «bad hierarchy level in row …» al guardar el PDF.
+
+    Tras quitar el bloque «## Índice» en _markdown_for_pymupdf_pdf, los temas Cornell
+    (### …) quedan colgando directamente de # Resumen; aquí se reajustan los «#».
+    """
+    last_level = 0
+    out: list[str] = []
+    in_fence = False
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        m = _HEADING_LINE_RE.match(line)
+        if not m:
+            out.append(line)
+            continue
+        raw_level = len(m.group(1))
+        rest = m.group(2)
+        if last_level == 0:
+            adj = 1
+        elif raw_level > last_level + 1:
+            adj = last_level + 1
+        else:
+            adj = raw_level
+        last_level = adj
+        out.append("#" * adj + rest)
+    return "\n".join(out)
 
 
 def _split_oversized_piece(piece: str, max_tokens: int) -> list[str]:
@@ -970,6 +1150,7 @@ def _summarize_one_chunk(part: int, total: int, body: str) -> tuple[int, str]:
 
 
 def summarize_cornell_chunked(full_text: str, max_chunk_content_tokens: int) -> str:
+    _check_stop_requested()
     chunks = chunk_text_by_tokens(full_text, max_chunk_content_tokens)
     total = len(chunks)
     if total == 0:
@@ -982,6 +1163,7 @@ def summarize_cornell_chunked(full_text: str, max_chunk_content_tokens: int) -> 
             for i, ch in enumerate(chunks, start=1)
         ]
         for fut in as_completed(futures):
+            _check_stop_requested()
             part, md = fut.result()
             partial_by_part[part] = md
     partials = [partial_by_part[i] for i in range(1, total + 1)]
@@ -998,6 +1180,7 @@ def summarize_cornell_chunked(full_text: str, max_chunk_content_tokens: int) -> 
 
 
 def summarize_document(full_text: str) -> str:
+    _check_stop_requested()
     single_user = f"{SUMMARY_CORNELL_USER_PREFIX}\n\n---\n\n{full_text}"
     prompt_tokens = count_tokens(single_user)
     current_ratio = _get_adaptive_prompt_ratio()
@@ -1188,9 +1371,11 @@ def write_summary_pdf(md_source_rel: pathlib.Path, summary_md: str) -> None:
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     pdf = MarkdownPdf()
     # toc=True: outline en el PDF según # / ## / ### (markdown_pdf → PyMuPDF).
+    md_pdf = ensure_markdown_h1_for_pdf(_markdown_for_pymupdf_pdf(summary_md))
+    md_pdf = normalize_markdown_heading_hierarchy_for_pdf(md_pdf)
     pdf.add_section(
         Section(
-            text=ensure_markdown_h1_for_pdf(_markdown_for_pymupdf_pdf(summary_md)),
+            text=md_pdf,
             toc=True,
         )
     )
@@ -1245,6 +1430,7 @@ def extract_vision_pdf_incremental(src: pathlib.Path, out_path: pathlib.Path) ->
     if start_i >= n:
         _atomic_write_text(out_path, "\n\n".join(chunks_prefix))
         return
+    _check_stop_requested()
 
     written_len = start_i
     write_lock = threading.Lock()
@@ -1268,6 +1454,7 @@ def extract_vision_pdf_incremental(src: pathlib.Path, out_path: pathlib.Path) ->
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(run_page, i): i for i in pending}
         for fut in as_completed(futures):
+            _check_stop_requested()
             i, text = fut.result()
             with write_lock:
                 page_bodies[i] = text
@@ -1280,6 +1467,7 @@ def extract_vision_pdf_incremental(src: pathlib.Path, out_path: pathlib.Path) ->
 def _extract_single_pdf(src: pathlib.Path) -> None:
     """Un PDF por tarea (hilo): abre su propio documento; no compartir fitz entre hilos."""
     try:
+        _check_stop_requested()
         print(src)
         out_md = completed_md_path_for_pdf(src)
         if pdf_has_selectable_text(src):
@@ -1298,6 +1486,7 @@ def _extract_single_pdf(src: pathlib.Path) -> None:
 def run_pdf_extraction() -> None:
     """Idempotent: skips PDFs that already have a non-empty completed_texts .md."""
     assert files_directory is not None
+    _check_stop_requested()
     pending: list[pathlib.Path] = []
     for root, _, files in os.walk(files_directory):
         for file in files:
@@ -1317,11 +1506,15 @@ def run_pdf_extraction() -> None:
         return
     workers = min(MAX_PARALLEL_PDFS, len(pending))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        pool.map(_extract_single_pdf, pending)
+        futures = [pool.submit(_extract_single_pdf, p) for p in pending]
+        for fut in as_completed(futures):
+            _check_stop_requested()
+            fut.result()
 
 
 def _summarize_single_md(md_path: pathlib.Path) -> None:
     try:
+        _check_stop_requested()
         rel = md_path.relative_to(completed_texts)
         out_summary_md = summarized_texts / rel
         out_summary_pdf = summary_pdfs / rel.with_suffix(".pdf")
@@ -1355,9 +1548,13 @@ def run_summarization_pipeline() -> None:
     paths = sorted(completed_texts.rglob("*.md"))
     if not paths:
         return
+    _check_stop_requested()
     workers = min(MAX_PARALLEL_SUMMARIES, len(paths))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        pool.map(_summarize_single_md, paths)
+        futures = [pool.submit(_summarize_single_md, p) for p in paths]
+        for fut in as_completed(futures):
+            _check_stop_requested()
+            fut.result()
 
 
 def extract_text_get_text_only(pdf_path: pathlib.Path) -> str:
@@ -1398,9 +1595,17 @@ def _ocr_single_page(pdf_path: pathlib.Path, page_index: int) -> str:
 
 
 if __name__ == "__main__":
-    configure_source_directory()
-    configure_vision_extraction_preference()
-    configure_lm_studio_model()
-    get_tokenizer()
-    run_pdf_extraction()
-    run_summarization_pipeline()
+    _install_stop_handlers()
+    try:
+        configure_source_directory()
+        configure_vision_extraction_preference()
+        configure_lm_studio_model()
+        get_tokenizer()
+        _start_stop_listener()
+        _check_stop_requested()
+        run_pdf_extraction()
+        _check_stop_requested()
+        run_summarization_pipeline()
+    except (StopRequested, KeyboardInterrupt):
+        _request_stop("Ejecución interrumpida.")
+        print("Proceso detenido por el usuario.")
