@@ -15,10 +15,13 @@ from summarizer.checkpoints import (
     summary_partials_enabled,
     try_load_window_checkpoint,
 )
+from summarizer.book_outline import chapter_outline_for_summary
 from summarizer.config import (
     ASSEMBLE_DEDUP_BORDER,
+    ASSEMBLE_DEDUP_GLOBAL,
     MAX_PARALLEL_CHUNKS,
     MAX_PARALLEL_WINDOW_SUMMARIES,
+    POST_UNIFY_ENABLED,
     SUMMARY_PAGE_OVERLAP,
 )
 from summarizer.fs import atomic_write_text
@@ -30,9 +33,11 @@ from summarizer.llm import (
 from summarizer.markdown_utils import slugify_anchor, split_markdown_by_page_headers
 from summarizer.models import CornellSummaryStructured, CornellTopicBlock
 from summarizer.prompts import (
+    BOOK_CHAPTER_OUTLINE_PREFIX,
     SUMMARY_CHUNK_WRAPPER,
     SUMMARY_CORNELL_USER_PREFIX,
     SUMMARY_WINDOW_WRAPPER,
+    UNIFY_ASSEMBLED_CORNELL_PROMPT,
     UNIFY_SUMMARIES_PROMPT,
 )
 from summarizer.stop import check_stop_requested
@@ -145,6 +150,25 @@ def _normalize_topic_title(title: str) -> str:
     return " ".join(title.lower().split())
 
 
+def format_cornell_structured_with_index(summary: CornellSummaryStructured) -> str:
+    """Un único CornellSummaryStructured a Markdown con ## Índice y bloques ###."""
+    if not summary.topics:
+        return ""
+    index_entries: list[tuple[str, str]] = []
+    topic_blocks: list[str] = []
+    used_slugs: set[str] = set()
+    for global_i, t in enumerate(summary.topics, start=1):
+        slug = slugify_anchor(t.title, fallback=f"tema-{global_i}")
+        if slug in used_slugs:
+            slug = f"{slug}-t{global_i}"
+        used_slugs.add(slug)
+        index_entries.append((t.title, slug))
+        topic_blocks.append(_format_cornell_topic_markdown(t, slug=slug))
+    index_lines = "\n".join(f"- [{title}](#{slug})" for title, slug in index_entries)
+    body = "\n\n".join(topic_blocks)
+    return f"# Resumen\n\n## Índice\n\n{index_lines}\n\n---\n\n{body}"
+
+
 def assemble_cornell_windows_markdown(
     ordered: list[tuple[int, int, CornellSummaryStructured]],
 ) -> str:
@@ -154,6 +178,7 @@ def assemble_cornell_windows_markdown(
     global_i = 0
     used_slugs: set[str] = set()
     last_norm: str | None = None
+    seen_global: set[str] = set()
 
     for win_i, (_start_p, _end_p, structured) in enumerate(ordered):
         if not structured.topics:
@@ -162,6 +187,9 @@ def assemble_cornell_windows_markdown(
             norm = _normalize_topic_title(t.title)
             if ASSEMBLE_DEDUP_BORDER and last_norm is not None and norm == last_norm:
                 continue
+            if ASSEMBLE_DEDUP_GLOBAL and norm in seen_global:
+                continue
+            seen_global.add(norm)
             last_norm = norm
             global_i += 1
             slug = slugify_anchor(t.title, fallback=f"tema-{global_i}")
@@ -185,10 +213,17 @@ def _strict_one_page_from_env() -> bool:
 
 
 def _chat_cornell_window(
-    start_p: int, end_p: int, body: str
+    start_p: int,
+    end_p: int,
+    body: str,
+    *,
+    chapter_outline: list[str] | None = None,
 ) -> CornellSummaryStructured:
     wrapped = SUMMARY_WINDOW_WRAPPER.format(start=start_p, end=end_p, body=body)
     user_content = f"{SUMMARY_CORNELL_USER_PREFIX}\n\n{wrapped}"
+    if chapter_outline:
+        outline_lines = "\n".join(f"- {c}" for c in chapter_outline)
+        user_content += BOOK_CHAPTER_OUTLINE_PREFIX.format(outline_lines=outline_lines)
     completion = chat_parse_with_retry(
         model=app_state.completion_model,
         messages=[{"role": "user", "content": user_content}],
@@ -197,13 +232,33 @@ def _chat_cornell_window(
     return completion_parsed_or_validate(completion, CornellSummaryStructured)
 
 
+def unify_assembled_cornell_markdown(assembled_md: str) -> str:
+    """Segunda pasada LLM: fusiona temas, elimina redundancias y reordena."""
+    user_content = UNIFY_ASSEMBLED_CORNELL_PROMPT.format(combined=assembled_md)
+    if count_tokens(user_content) > app_state.MAX_INPUT_TOKENS:
+        print(
+            "Aviso: consolidación final omitida (prompt supera MAX_INPUT_TOKENS). "
+            "Reduzca el documento o suba el límite en LM Studio."
+        )
+        return assembled_md
+    try:
+        structured = _chat_cornell_structured(user_content)
+        if not structured.topics:
+            return assembled_md
+        return format_cornell_structured_with_index(structured)
+    except Exception as ex:
+        print(f"Consolidación final falló; se mantiene el ensamblado de ventanas: {ex}")
+        return assembled_md
+
+
 def summarize_document_paged_windows(
     full_text: str,
     *,
     partials_dir: Path | None = None,
 ) -> str:
     """
-    Resumen Cornell por ventanas de páginas (presupuesto + solape); ensamblado sin modelo.
+    Resumen Cornell por ventanas de páginas (presupuesto + solape); ensamblado y, por defecto,
+    consolidación final con el modelo (``SUMMARIZER_POST_UNIFY``).
 
     Si ``partials_dir`` está definido y SUMMARIZER_SUMMARY_PARTIALS no desactiva la función,
     cada ventana se guarda en ``window_NNNN.json`` (reanudable si el contenido de la ventana
@@ -213,6 +268,13 @@ def summarize_document_paged_windows(
     if not pages:
         return ""
     check_stop_requested()
+
+    chapter_outline = chapter_outline_for_summary(full_text)
+    if chapter_outline:
+        print(
+            f"Referencia de capítulos ({len(chapter_outline)} entradas): "
+            "entorno o índice detectado en el texto."
+        )
 
     budget = _summary_window_token_budget()
     print(
@@ -269,7 +331,9 @@ def summarize_document_paged_windows(
             if cached is not None:
                 return task_i, (sp, ep, cached)
         try:
-            structured = _chat_cornell_window(sp, ep, body)
+            structured = _chat_cornell_window(
+                sp, ep, body, chapter_outline=chapter_outline
+            )
         except BadRequestError as ex:
             if is_context_overflow_error(ex):
                 app_state.record_prompt_ratio_overflow()
@@ -296,6 +360,9 @@ def summarize_document_paged_windows(
         else None
     )
     md = assemble_cornell_windows_markdown(ordered_struct)
+    if POST_UNIFY_ENABLED and md.strip():
+        print("Consolidación final del resumen (fusionar temas, alinear índice)…")
+        md = unify_assembled_cornell_markdown(md)
     if combined_md_path is not None and md.strip():
         atomic_write_text(combined_md_path, md)
     if md.strip():

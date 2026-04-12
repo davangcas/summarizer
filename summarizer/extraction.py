@@ -22,6 +22,7 @@ from summarizer.markdown_utils import (
 from summarizer.models import OCRPageOutput
 from summarizer.output import (
     completed_md_path_for_pdf,
+    maybe_write_completed_texts_ocr_clone_pdf,
     nonempty_utf8_file,
     write_completed_text,
 )
@@ -170,6 +171,7 @@ def _extract_single_pdf(src: Path) -> None:
             write_completed_text(src, file_text)
         elif app_state.use_vision_for_scanned_pdfs:
             extract_vision_pdf_incremental(src, out_md)
+            maybe_write_completed_texts_ocr_clone_pdf(src)
         else:
             print(
                 f"Sin texto extraíble (get_text vacío); visión desactivada — omitido: {src}"
@@ -188,11 +190,14 @@ def run_pdf_extraction() -> None:
             if not file.endswith(".pdf"):
                 continue
             src = Path(root) / file
+            if not app_state.source_pdf_is_in_scope(src):
+                continue
             out_md = completed_md_path_for_pdf(src)
             if nonempty_utf8_file(out_md) and not _completed_md_needs_page_markers(
                 out_md
             ):
                 print(f"Skip extract (already in completed_texts): {src}")
+                maybe_write_completed_texts_ocr_clone_pdf(src)
                 continue
             if _completed_md_needs_page_markers(out_md):
                 print(f"Re-extracción (marcadores de página): {src}")

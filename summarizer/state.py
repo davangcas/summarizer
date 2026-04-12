@@ -13,7 +13,26 @@ from summarizer.config import (
 )
 
 files_directory: pathlib.Path | None = None
+# Si no es None, solo se procesan estos PDF (rutas absolutas resueltas).
+source_pdf_paths: frozenset[pathlib.Path] | None = None
 use_vision_for_scanned_pdfs: bool = False
+
+
+def source_pdf_is_in_scope(pdf_path: pathlib.Path) -> bool:
+    """True si el PDF debe procesarse según ``source_pdf_paths`` (o todos si es None)."""
+    if source_pdf_paths is None:
+        return True
+    return pdf_path.resolve() in source_pdf_paths
+
+
+def completed_rel_matches_source_filter(rel: pathlib.Path) -> bool:
+    """True si el .md bajo completed_texts corresponde a un PDF seleccionado."""
+    assert files_directory is not None
+    if source_pdf_paths is None:
+        return True
+    expected_pdf = (files_directory / rel).with_suffix(".pdf").resolve()
+    return expected_pdf in source_pdf_paths
+
 
 completion_model: str = ""
 MAX_CONTEXT_TOKENS: int = 0

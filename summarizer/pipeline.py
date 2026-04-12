@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from summarizer import paths
+from summarizer import state as app_state
 from summarizer.config import MAX_PARALLEL_SUMMARIES
 from summarizer.output import summarize_single_completed_md
 from summarizer.stop import check_stop_requested
@@ -13,6 +14,13 @@ from summarizer.stop import check_stop_requested
 def run_summarization_pipeline() -> None:
     """Idempotent: skips when summary .md and PDF exist; rebuilds PDF only if .md exists but PDF missing."""
     file_paths = sorted(paths.completed_texts.rglob("*.md"))
+    file_paths = [
+        p
+        for p in file_paths
+        if app_state.completed_rel_matches_source_filter(
+            p.relative_to(paths.completed_texts)
+        )
+    ]
     if not file_paths:
         return
     check_stop_requested()

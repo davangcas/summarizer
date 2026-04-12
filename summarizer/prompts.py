@@ -18,7 +18,9 @@ Instrucciones:
 3. Por tema: `title` debe reflejar esa sección o temática (adaptado o acortado si hace falta); nunca pongas en `title` números de página, rangos tipo "páginas X–Y", "Pág.", ni metadatos de fragmento. cues como repaso; notes densa (definiciones, pasos, supuestos, fórmulas cuando existan); topic_summary cierra la idea y utilidad.
 4. Prioriza rigor: hechos, definiciones, datos y razonamiento del texto; no inventes citas, referencias ni detalles inexistentes en el material.
 5. Si el documento mezcla idiomas, sintetiza en español salvo nombres propios o términos técnicos estándar.
-6. No incluyas texto fuera del JSON (sin markdown envolvente, sin comentarios)."""
+6. No incluyas texto fuera del JSON (sin markdown envolvente, sin comentarios).
+7. No crees temas "meta" que solo repitan el título del libro o del documento sin contenido sustantivo (definiciones, hechos o argumentos del texto). Si un bloque no aporta más que una frase genérica, no lo incluyas como topic separado.
+8. Evita duplicar el mismo capítulo o temática con títulos casi idénticos (p. ej. título del libro y "título del libro: origen"); unifica en un solo topic cuando sea el mismo asunto."""
 
 SUMMARY_CHUNK_WRAPPER = """Contexto: este bloque es el fragmento {part} de {total} de un documento largo (no tienes el resto).
 
@@ -41,6 +43,30 @@ Qué hacer:
 
 ---
 {body}"""
+
+BOOK_CHAPTER_OUTLINE_PREFIX = """
+
+Lista de referencia de capítulos o partes del libro (orden del original). Cuando el fragmento cubra alguno, alinea el `title` del topic con el nombre más cercano o una variante clara; no inventes capítulos que no aparezcan en el texto del fragmento.
+Capítulos:
+{outline_lines}
+"""
+
+UNIFY_ASSEMBLED_CORNELL_PROMPT = """Rol: editor académico de apuntes estilo Cornell.
+
+Recibes el Markdown completo de un resumen ya generado: incluye `## Índice` con enlaces y bloques `###` con Pistas, Notas y Resumen del tema. Puede haber temas duplicados o solapados, títulos redundantes, o secciones triviales/meta sin sustancia.
+
+Objetivo: devuelve UN ÚNICO JSON con el esquema habitual: lista `topics` donde cada elemento tiene title, cues, notes, topic_summary.
+
+Reglas:
+1. Fusiona temas que traten el mismo asunto (títulos similares o contenido redundante); integra cues y notes sin repetir ideas.
+2. Elimina temas triviales: solo dicen que el autor es conocido, repiten el título del libro sin contenido nuevo, o son frases genéricas sin datos del texto.
+3. Ordena los temas en secuencia lógica coherente con el documento (orden de exposición del autor, no orden aleatorio).
+4. Mantén rigor: no inventes hechos; síntesis densa en notes; topic_summary cierra la utilidad del tema.
+5. Salida: solo JSON, en español, sin markdown fuera del JSON.
+
+---
+{combined}
+"""
 
 UNIFY_SUMMARIES_PROMPT = """Rol: editor de apuntes. Recibes varios resúmenes parciales del MISMO documento (Markdown) tras ---.
 

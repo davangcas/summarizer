@@ -59,6 +59,28 @@ ASSEMBLE_DEDUP_BORDER = os.environ.get(
     "SUMMARIZER_ASSEMBLE_DEDUP_BORDER", ""
 ).strip().lower() in ("1", "true", "yes", "sí", "si", "on")
 
+
+def env_flag(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("0", "false", "no", "n", "off"):
+        return False
+    if raw in ("1", "true", "yes", "sí", "si", "y", "on"):
+        return True
+    return default
+
+
+# Tras ensamblar ventanas, una pasada LLM fusiona temas y limpia el índice (salvo límite de tokens).
+POST_UNIFY_ENABLED = env_flag("SUMMARIZER_POST_UNIFY", default=True)
+# Heurística de índice del libro en las primeras páginas (INDICE + líneas con puntos guía).
+BOOK_OUTLINE_HEURISTIC_ENABLED = env_flag(
+    "SUMMARIZER_BOOK_OUTLINE_HEURISTIC", default=True
+)
+# Si True, en ensamblado se omite un segundo tema con el mismo título normalizado (conserva el primero).
+# Por defecto False: la consolidación post-unify fusiona duplicados sin perder notas entre ventanas.
+ASSEMBLE_DEDUP_GLOBAL = env_flag("SUMMARIZER_ASSEMBLE_DEDUP_GLOBAL", default=False)
+
 REQUEST_TIMEOUT_SECONDS = env_optional_timeout_seconds(
     "SUMMARIZER_REQUEST_TIMEOUT_SECONDS", None
 )
