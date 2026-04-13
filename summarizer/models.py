@@ -38,10 +38,12 @@ class CornellTopicBlock(BaseModel):
     )
     notes: str = Field(
         description=(
-            "Síntesis académica densa: definiciones, hipótesis, procedimientos, fórmulas (en texto o LaTeX ligero), "
-            "relaciones causa-efecto y condiciones límite del modelo o experimento cuando el original las mencione. "
-            "No pegues párrafos literales extensos. "
-            "Solo si el fragmento termina antes de cerrar el tema y el origen no lo ciere aquí, indica al final: "
+            "Cuerpo principal de apuntes académicos (el campo más largo del tema salvo temas triviales de una línea): "
+            "varios párrafos o viñetas con definiciones, hipótesis, procedimientos paso a paso, notación, "
+            "fórmulas (texto o LaTeX ligero), relaciones entre ideas, condiciones de aplicación y límites del modelo "
+            "cuando el original los mencione. Parafrasea en lugar de copiar párrafos literales largos, "
+            "pero conserva el detalle técnico útil. "
+            "Solo si el fragmento termina antes de cerrar el tema y el origen no lo cierra aquí, indica al final: "
             "(continúa en el siguiente fragmento)."
         )
     )
