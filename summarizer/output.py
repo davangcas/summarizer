@@ -19,6 +19,12 @@ from summarizer.pdf_markdown import (
 )
 
 
+def summary_pdfs_output_dir() -> Path:
+    """Directorio base para los PDF generados a partir de los resúmenes."""
+    base = app_state.summary_pdfs_directory
+    return base if base is not None else paths.summary_pdfs
+
+
 def completed_md_path_for_pdf(src: Path) -> Path:
     assert app_state.files_directory is not None
     rel = src.relative_to(app_state.files_directory)
@@ -93,7 +99,7 @@ def render_markdown_to_pdf(out_pdf: Path, markdown: str) -> None:
 
 
 def write_summary_pdf(md_source_rel: Path, summary_md: str) -> None:
-    out_pdf = paths.summary_pdfs / md_source_rel.with_suffix(".pdf")
+    out_pdf = summary_pdfs_output_dir() / md_source_rel.with_suffix(".pdf")
     render_markdown_to_pdf(out_pdf, summary_md)
 
 
@@ -102,7 +108,7 @@ def summarize_single_completed_md(md_path: Path) -> None:
         check_stop_requested()
         rel = md_path.relative_to(paths.completed_texts)
         out_summary_md = paths.summarized_texts / rel
-        out_summary_pdf = paths.summary_pdfs / rel.with_suffix(".pdf")
+        out_summary_pdf = summary_pdfs_output_dir() / rel.with_suffix(".pdf")
 
         if nonempty_utf8_file(out_summary_md) and nonempty_pdf_file(out_summary_pdf):
             print(f"Skip summarize (summary + PDF done): {rel}")

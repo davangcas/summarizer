@@ -5,6 +5,7 @@ from summarizer.lm_studio import configure_lm_studio_model
 from summarizer.pipeline import run_summarization_pipeline
 from summarizer.setup_flow import (
     configure_source_directory,
+    configure_summary_pdfs_destination,
     configure_vision_extraction_preference,
 )
 from summarizer.stop import (
@@ -20,6 +21,7 @@ if __name__ == "__main__":
     install_stop_handlers()
     try:
         configure_source_directory()
+        configure_summary_pdfs_destination()
         configure_vision_extraction_preference()
         configure_lm_studio_model()
         get_tokenizer()

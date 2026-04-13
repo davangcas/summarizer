@@ -6,6 +6,7 @@ import importlib.util
 import os
 from pathlib import Path
 
+from summarizer import paths
 from summarizer import state as app_state
 
 
@@ -235,3 +236,131 @@ def configure_vision_extraction_preference() -> None:
         f"Extracción por imágenes para PDF sin texto: "
         f"{'sí' if app_state.use_vision_for_scanned_pdfs else 'no'}"
     )
+
+
+def _configure_summary_pdfs_destination_gui() -> None:
+    """Ventana: carpeta predeterminada del proyecto u otra carpeta."""
+    import tkinter as tk
+    from tkinter import filedialog, ttk
+
+    choice: dict[str, str | None] = {"action": None}
+
+    root = tk.Tk()
+    root.title("Destino de los PDF de resumen")
+    root.resizable(False, False)
+    root.attributes("-topmost", True)
+
+    frm = ttk.Frame(root, padding=20)
+    frm.pack()
+
+    default_txt = str(paths.summary_pdfs.resolve())
+    ttk.Label(
+        frm,
+        text=(
+            "Los PDF finales (resúmenes) se pueden guardar en la carpeta\n"
+            "del proyecto o en la ruta que elija."
+        ),
+        justify=tk.CENTER,
+    ).pack(pady=(0, 8))
+    ttk.Label(
+        frm,
+        text=f"Predeterminada:\n{default_txt}",
+        justify=tk.CENTER,
+        wraplength=420,
+    ).pack(pady=(0, 14))
+
+    def on_default() -> None:
+        choice["action"] = "default"
+        root.quit()
+
+    def on_pick() -> None:
+        choice["action"] = "pick"
+        root.quit()
+
+    def on_cancel() -> None:
+        choice["action"] = None
+        root.quit()
+
+    ttk.Button(
+        frm,
+        text="Usar carpeta predeterminada",
+        command=on_default,
+    ).pack(fill=tk.X, pady=4)
+    ttk.Button(
+        frm,
+        text="Elegir otra carpeta…",
+        command=on_pick,
+    ).pack(fill=tk.X, pady=4)
+    ttk.Button(frm, text="Cancelar", command=on_cancel).pack(fill=tk.X, pady=(10, 0))
+
+    root.protocol("WM_DELETE_WINDOW", on_cancel)
+    root.update_idletasks()
+    w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+
+    root.mainloop()
+    root.destroy()
+
+    act = choice["action"]
+    if act is None:
+        raise SystemExit("Operación cancelada.")
+    if act == "default":
+        app_state.summary_pdfs_directory = None
+        print(
+            f"Carpeta destino PDF de resumen (predeterminada): {paths.summary_pdfs.resolve()}"
+        )
+        return
+
+    dlg = tk.Tk()
+    dlg.withdraw()
+    dlg.attributes("-topmost", True)
+    try:
+        chosen = filedialog.askdirectory(
+            title="Seleccione la carpeta para los PDF de resumen",
+            parent=dlg,
+        )
+        if not chosen:
+            raise SystemExit("No se seleccionó ninguna carpeta.")
+        app_state.summary_pdfs_directory = Path(chosen).resolve()
+        print(f"Carpeta destino PDF de resumen: {app_state.summary_pdfs_directory}")
+    finally:
+        dlg.destroy()
+
+
+def configure_summary_pdfs_destination() -> None:
+    """
+    Define ``summary_pdfs_directory`` (o None para la carpeta del proyecto).
+
+    Entorno:
+    - ``SUMMARIZER_SUMMARY_PDF_DIRECTORY``: ruta absoluta o relativa; debe ser
+      una carpeta existente o creable (se crean subcarpetas al escribir).
+    - ``SUMMARIZER_USE_DEFAULT_SUMMARY_PDF_DIR=1`` / ``true`` / ``yes`` / ``sí`` / ``si``:
+      fuerza la carpeta predeterminada del proyecto (sin diálogo).
+    """
+    raw_default = (
+        os.environ.get("SUMMARIZER_USE_DEFAULT_SUMMARY_PDF_DIR", "").strip().lower()
+    )
+    if raw_default in ("1", "true", "yes", "sí", "si", "y", "on"):
+        app_state.summary_pdfs_directory = None
+        print(
+            "Carpeta destino PDF de resumen (predeterminada, entorno): "
+            f"{paths.summary_pdfs.resolve()}"
+        )
+        return
+
+    env = os.environ.get("SUMMARIZER_SUMMARY_PDF_DIRECTORY", "").strip()
+    if env:
+        p = Path(env).expanduser().resolve()
+        app_state.summary_pdfs_directory = p
+        print(f"Carpeta destino PDF de resumen (entorno): {p}")
+        return
+
+    if importlib.util.find_spec("tkinter") is None:
+        app_state.summary_pdfs_directory = None
+        print(
+            "Sin tkinter: se usa la carpeta predeterminada para PDF de resumen: "
+            f"{paths.summary_pdfs.resolve()}"
+        )
+        return
+    _configure_summary_pdfs_destination_gui()

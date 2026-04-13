@@ -48,7 +48,7 @@ def _format_cornell_topic_markdown(t: CornellTopicBlock, *, slug: str) -> str:
     cues_md = "\n".join(f"- {c}" for c in t.cues) if t.cues else "-"
     return (
         f"### {t.title} {{#{slug}}}\n\n"
-        f"#### Pistas (cue)\n{cues_md}\n\n"
+        f"#### Pistas (claves)\n{cues_md}\n\n"
         f"#### Notas\n{t.notes}\n\n"
         f"#### Resumen del tema\n{t.topic_summary}"
     )

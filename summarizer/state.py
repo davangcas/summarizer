@@ -15,6 +15,8 @@ from summarizer.config import (
 files_directory: pathlib.Path | None = None
 # Si no es None, solo se procesan estos PDF (rutas absolutas resueltas).
 source_pdf_paths: frozenset[pathlib.Path] | None = None
+# Carpeta para los PDF de resumen finales; None = usar ``paths.summary_pdfs`` del proyecto.
+summary_pdfs_directory: pathlib.Path | None = None
 use_vision_for_scanned_pdfs: bool = False
 
 
