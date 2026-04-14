@@ -3,6 +3,7 @@
 summary_pdfs/
 files/
 completed_texts/
+completed_texts_ocr/
 summarized_texts/
 .ruff_cache/
 summary_partials/

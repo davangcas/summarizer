@@ -55,7 +55,10 @@ def _format_cornell_topic_markdown(t: CornellTopicBlock, *, slug: str) -> str:
 
 
 def format_cornell_markdown(
-    summary: CornellSummaryStructured, *, document_title: bool = True
+    summary: CornellSummaryStructured,
+    *,
+    document_title: bool = True,
+    h1_title: str = "Resumen",
 ) -> str:
     if not summary.topics:
         return ""
@@ -65,7 +68,7 @@ def format_cornell_markdown(
         blocks.append(_format_cornell_topic_markdown(t, slug=slug))
     body = "\n\n".join(blocks)
     if document_title:
-        return f"# Resumen\n\n{body}"
+        return f"# {h1_title}\n\n{body}"
     return body
 
 
@@ -150,7 +153,9 @@ def _normalize_topic_title(title: str) -> str:
     return " ".join(title.lower().split())
 
 
-def format_cornell_structured_with_index(summary: CornellSummaryStructured) -> str:
+def format_cornell_structured_with_index(
+    summary: CornellSummaryStructured, *, h1_title: str = "Resumen"
+) -> str:
     """Un único CornellSummaryStructured a Markdown con ## Índice y bloques ###."""
     if not summary.topics:
         return ""
@@ -166,11 +171,13 @@ def format_cornell_structured_with_index(summary: CornellSummaryStructured) -> s
         topic_blocks.append(_format_cornell_topic_markdown(t, slug=slug))
     index_lines = "\n".join(f"- [{title}](#{slug})" for title, slug in index_entries)
     body = "\n\n".join(topic_blocks)
-    return f"# Resumen\n\n## Índice\n\n{index_lines}\n\n---\n\n{body}"
+    return f"# {h1_title}\n\n## Índice\n\n{index_lines}\n\n---\n\n{body}"
 
 
 def assemble_cornell_windows_markdown(
     ordered: list[tuple[int, int, CornellSummaryStructured]],
+    *,
+    h1_title: str = "Resumen",
 ) -> str:
     """Une ventanas en un único Markdown con índice; temas Cornell seguidos sin agrupar por rango de páginas."""
     index_entries: list[tuple[str, str]] = []
@@ -204,7 +211,7 @@ def assemble_cornell_windows_markdown(
 
     index_lines = "\n".join(f"- [{title}](#{slug})" for title, slug in index_entries)
     body = "\n\n".join(topic_blocks)
-    return f"# Resumen\n\n## Índice\n\n{index_lines}\n\n---\n\n{body}"
+    return f"# {h1_title}\n\n## Índice\n\n{index_lines}\n\n---\n\n{body}"
 
 
 def _strict_one_page_from_env() -> bool:
@@ -232,7 +239,9 @@ def _chat_cornell_window(
     return completion_parsed_or_validate(completion, CornellSummaryStructured)
 
 
-def unify_assembled_cornell_markdown(assembled_md: str) -> str:
+def unify_assembled_cornell_markdown(
+    assembled_md: str, *, h1_title: str = "Resumen"
+) -> str:
     """Segunda pasada LLM: fusiona temas, elimina redundancias y reordena."""
     user_content = UNIFY_ASSEMBLED_CORNELL_PROMPT.format(combined=assembled_md)
     if count_tokens(user_content) > app_state.MAX_INPUT_TOKENS:
@@ -245,7 +254,7 @@ def unify_assembled_cornell_markdown(assembled_md: str) -> str:
         structured = _chat_cornell_structured(user_content)
         if not structured.topics:
             return assembled_md
-        return format_cornell_structured_with_index(structured)
+        return format_cornell_structured_with_index(structured, h1_title=h1_title)
     except Exception as ex:
         print(f"Consolidación final falló; se mantiene el ensamblado de ventanas: {ex}")
         return assembled_md
@@ -255,6 +264,7 @@ def summarize_document_paged_windows(
     full_text: str,
     *,
     partials_dir: Path | None = None,
+    h1_title: str = "Resumen",
 ) -> str:
     """
     Resumen Cornell por ventanas de páginas (presupuesto + solape); ensamblado y, por defecto,
@@ -359,10 +369,10 @@ def summarize_document_paged_windows(
         if use_partials and partials_dir
         else None
     )
-    md = assemble_cornell_windows_markdown(ordered_struct)
+    md = assemble_cornell_windows_markdown(ordered_struct, h1_title=h1_title)
     if POST_UNIFY_ENABLED and md.strip():
         print("Consolidación final del resumen (fusionar temas, alinear índice)…")
-        md = unify_assembled_cornell_markdown(md)
+        md = unify_assembled_cornell_markdown(md, h1_title=h1_title)
     if combined_md_path is not None and md.strip():
         atomic_write_text(combined_md_path, md)
     if md.strip():
@@ -379,9 +389,11 @@ def _chat_cornell_structured(user_content: str) -> CornellSummaryStructured:
     return completion_parsed_or_validate(completion, CornellSummaryStructured)
 
 
-def summarize_cornell_single(full_text: str) -> str:
+def summarize_cornell_single(full_text: str, *, h1_title: str = "Resumen") -> str:
     user_content = f"{SUMMARY_CORNELL_USER_PREFIX}\n\n---\n\n{full_text}"
-    return format_cornell_markdown(_chat_cornell_structured(user_content))
+    return format_cornell_markdown(
+        _chat_cornell_structured(user_content), h1_title=h1_title
+    )
 
 
 def _summarize_one_chunk(part: int, total: int, body: str) -> tuple[int, str]:
@@ -393,7 +405,9 @@ def _summarize_one_chunk(part: int, total: int, body: str) -> tuple[int, str]:
     return part, md
 
 
-def summarize_cornell_chunked(full_text: str, max_chunk_content_tokens: int) -> str:
+def summarize_cornell_chunked(
+    full_text: str, max_chunk_content_tokens: int, *, h1_title: str = "Resumen"
+) -> str:
     check_stop_requested()
     chunks = chunk_text_by_tokens(full_text, max_chunk_content_tokens)
     total = len(chunks)
@@ -411,19 +425,21 @@ def summarize_cornell_chunked(full_text: str, max_chunk_content_tokens: int) -> 
             part, md = fut.result()
             partial_by_part[part] = md
     partials = [partial_by_part[i] for i in range(1, total + 1)]
-    combined_md = "# Resumen (fragmentos)\n\n" + "\n\n".join(
+    combined_md = f"# {h1_title} (fragmentos)\n\n" + "\n\n".join(
         f"## Fragmento {i} de {total}\n\n{md}" for i, md in enumerate(partials, start=1)
     )
     unify_user = UNIFY_SUMMARIES_PROMPT.format(combined=combined_md)
     if count_tokens(unify_user) <= app_state.MAX_INPUT_TOKENS:
         try:
-            return format_cornell_markdown(_chat_cornell_structured(unify_user))
+            return format_cornell_markdown(
+                _chat_cornell_structured(unify_user), h1_title=h1_title
+            )
         except Exception:
             return combined_md
     return combined_md
 
 
-def summarize_document(full_text: str) -> str:
+def summarize_document(full_text: str, *, h1_title: str = "Resumen") -> str:
     check_stop_requested()
     single_user = f"{SUMMARY_CORNELL_USER_PREFIX}\n\n---\n\n{full_text}"
     prompt_tokens = count_tokens(single_user)
@@ -436,7 +452,7 @@ def summarize_document(full_text: str) -> str:
     )
     if prompt_tokens <= effective_input_budget:
         try:
-            result = summarize_cornell_single(full_text)
+            result = summarize_cornell_single(full_text, h1_title=h1_title)
             new_ratio = app_state.record_prompt_ratio_success()
             print(
                 f"Resumen OK; elevando ratio adaptativo a {int(new_ratio * 100)}% para próximos documentos."
@@ -456,7 +472,9 @@ def summarize_document(full_text: str) -> str:
     max_chunk_content = max(512, effective_input_budget - overhead - 200)
     for _ in range(4):
         try:
-            result = summarize_cornell_chunked(full_text, max_chunk_content)
+            result = summarize_cornell_chunked(
+                full_text, max_chunk_content, h1_title=h1_title
+            )
             new_ratio = app_state.record_prompt_ratio_success()
             print(
                 f"Resumen chunked OK; elevando ratio adaptativo a {int(new_ratio * 100)}%."
@@ -473,4 +491,4 @@ def summarize_document(full_text: str) -> str:
                 "Context overflow detectado; reduciendo tamaño de fragmentos a "
                 f"~{max_chunk_content} tokens y ratio adaptativo a {int(new_ratio * 100)}%..."
             )
-    return summarize_cornell_chunked(full_text, max_chunk_content)
+    return summarize_cornell_chunked(full_text, max_chunk_content, h1_title=h1_title)

@@ -60,11 +60,11 @@ def markdown_for_pymupdf_pdf(markdown: str) -> str:
     return text
 
 
-def ensure_markdown_h1_for_pdf(markdown: str) -> str:
+def ensure_markdown_h1_for_pdf(markdown: str, *, fallback_h1: str = "Resumen") -> str:
     """PyMuPDF falla con set_toc si el primer heading no es # (ver 'hierarchy level of item 0 must be 1')."""
     text = markdown.strip()
     if not text:
-        return "# Resumen\n"
+        return f"# {fallback_h1}\n"
     for line in text.splitlines():
         s = line.strip()
         if not s:
@@ -72,7 +72,7 @@ def ensure_markdown_h1_for_pdf(markdown: str) -> str:
         if s.startswith("#") and not s.startswith("##"):
             return markdown
         break
-    return f"# Resumen\n\n{text}"
+    return f"# {fallback_h1}\n\n{text}"
 
 
 def normalize_markdown_heading_hierarchy_for_pdf(markdown: str) -> str:

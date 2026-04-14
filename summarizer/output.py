@@ -54,7 +54,9 @@ def maybe_write_completed_texts_ocr_clone_pdf(src: Path) -> None:
     if nonempty_pdf_file(ocr_pdf):
         return
     render_markdown_to_pdf(
-        ocr_pdf, out_md.read_text(encoding="utf-8", errors="replace")
+        ocr_pdf,
+        out_md.read_text(encoding="utf-8", errors="replace"),
+        fallback_h1=src.stem,
     )
 
 
@@ -83,11 +85,15 @@ def write_summary_markdown(md_source_rel: Path, summary_md: str) -> None:
     out_md.write_text(summary_md, encoding="utf-8")
 
 
-def render_markdown_to_pdf(out_pdf: Path, markdown: str) -> None:
+def render_markdown_to_pdf(
+    out_pdf: Path, markdown: str, *, fallback_h1: str = "Resumen"
+) -> None:
     """Convierte Markdown a PDF (mismo pipeline que los resúmenes)."""
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     pdf = MarkdownPdf()
-    md_pdf = ensure_markdown_h1_for_pdf(markdown_for_pymupdf_pdf(markdown))
+    md_pdf = ensure_markdown_h1_for_pdf(
+        markdown_for_pymupdf_pdf(markdown), fallback_h1=fallback_h1
+    )
     md_pdf = normalize_markdown_heading_hierarchy_for_pdf(md_pdf)
     pdf.add_section(
         Section(
@@ -100,7 +106,7 @@ def render_markdown_to_pdf(out_pdf: Path, markdown: str) -> None:
 
 def write_summary_pdf(md_source_rel: Path, summary_md: str) -> None:
     out_pdf = summary_pdfs_output_dir() / md_source_rel.with_suffix(".pdf")
-    render_markdown_to_pdf(out_pdf, summary_md)
+    render_markdown_to_pdf(out_pdf, summary_md, fallback_h1=md_source_rel.stem)
 
 
 def summarize_single_completed_md(md_path: Path) -> None:
@@ -126,7 +132,9 @@ def summarize_single_completed_md(md_path: Path) -> None:
         if not full_text.strip():
             return
         partials = summary_partials_dir_for_completed_rel(rel)
-        summary_md = summarize_document_paged_windows(full_text, partials_dir=partials)
+        summary_md = summarize_document_paged_windows(
+            full_text, partials_dir=partials, h1_title=rel.stem
+        )
         if summary_md.strip():
             write_summary_markdown(rel, summary_md)
             write_summary_pdf(rel, summary_md)
