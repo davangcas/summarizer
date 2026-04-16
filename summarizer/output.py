@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from markdown_pdf import MarkdownPdf, Section
@@ -114,6 +115,23 @@ def write_summary_pdf(md_source_rel: Path, summary_md: str) -> None:
     render_markdown_to_pdf(out_pdf, summary_md, fallback_h1=md_source_rel.stem)
 
 
+def _cleanup_success_artifacts(rel: Path) -> None:
+    completed_md = paths.completed_texts / rel
+    summary_md = paths.summarized_texts / rel
+    partials_dir = summary_partials_dir_for_completed_rel(rel)
+    for candidate in (completed_md, summary_md):
+        try:
+            if candidate.exists():
+                candidate.unlink()
+        except OSError as ex:
+            print(f"Aviso limpieza (archivo): {candidate} -> {ex}")
+    try:
+        if partials_dir.exists():
+            shutil.rmtree(partials_dir, ignore_errors=False)
+    except OSError as ex:
+        print(f"Aviso limpieza (parciales): {partials_dir} -> {ex}")
+
+
 def summarize_single_completed_md(md_path: Path) -> None:
     try:
         check_stop_requested()
@@ -130,6 +148,8 @@ def summarize_single_completed_md(md_path: Path) -> None:
         ):
             print(f"Resume PDF from summary: {rel}")
             write_summary_pdf(rel, out_summary_md.read_text(encoding="utf-8"))
+            if nonempty_pdf_file(out_summary_pdf):
+                _cleanup_success_artifacts(rel)
             return
 
         print(f"Summarizing: {md_path}")
@@ -143,5 +163,7 @@ def summarize_single_completed_md(md_path: Path) -> None:
         if summary_md.strip():
             write_summary_markdown(rel, summary_md)
             write_summary_pdf(rel, summary_md)
+            if nonempty_pdf_file(out_summary_pdf):
+                _cleanup_success_artifacts(rel)
     except Exception as ex:
         print(f"Error summarizing {md_path}: {ex}")

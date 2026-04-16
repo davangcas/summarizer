@@ -20,9 +20,8 @@ from summarizer.config import (
     ASSEMBLE_DEDUP_BORDER,
     ASSEMBLE_DEDUP_GLOBAL,
     MAX_PARALLEL_CHUNKS,
-    MAX_PARALLEL_WINDOW_SUMMARIES,
-    POST_UNIFY_ENABLED,
     SUMMARY_PAGE_OVERLAP,
+    SUMMARY_MAX_PAGES_PER_WINDOW,
 )
 from summarizer.fs import atomic_write_text
 from summarizer.llm import (
@@ -37,7 +36,6 @@ from summarizer.prompts import (
     SUMMARY_CHUNK_WRAPPER,
     SUMMARY_CORNELL_USER_PREFIX,
     SUMMARY_WINDOW_WRAPPER,
-    UNIFY_ASSEMBLED_CORNELL_PROMPT,
     UNIFY_SUMMARIES_PROMPT,
 )
 from summarizer.stop import check_stop_requested
@@ -72,81 +70,48 @@ def format_cornell_markdown(
     return body
 
 
-def _window_tokens_for_body(
-    start_p: int, end_p: int, body: str, *, overhead_reserve: int
-) -> int:
-    wrapped = SUMMARY_WINDOW_WRAPPER.format(start=start_p, end=end_p, body=body)
-    user_content = f"{SUMMARY_CORNELL_USER_PREFIX}\n\n{wrapped}"
-    return count_tokens(user_content) + overhead_reserve
-
-
-def _summary_window_token_budget() -> int:
-    current_ratio = app_state.get_adaptive_prompt_ratio()
-    return max(512, int(app_state.MAX_CONTEXT_TOKENS * current_ratio))
-
-
 def build_page_windows(
     pages: list[tuple[int, str]],
     *,
     overlap: int,
-    budget_tokens: int,
-    strict_one_page: bool,
+    max_pages_per_window: int,
 ) -> list[tuple[int, int, str]]:
-    """Agrupa páginas consecutivas hasta budget_tokens; solape entre ventanas = overlap páginas."""
+    """Agrupa páginas por bloques con máximo fijo de páginas por ventana."""
     if not pages:
         return []
-    if strict_one_page:
-        out: list[tuple[int, int, str]] = []
-        for pnum, ptext in pages:
-            out.append(
-                (
-                    pnum,
-                    pnum,
-                    f"## Página {pnum}\n\n{ptext}",
-                )
-            )
-        return out
-
+    max_pages = max(1, max_pages_per_window)
+    step = max(1, max_pages - max(0, overlap))
     n = len(pages)
-    windows: list[tuple[int, int, str]] = []
-    overhead_reserve = 64
+    out: list[tuple[int, int, str]] = []
     idx = 0
     while idx < n:
-        start_p = pages[idx][0]
-        end_idx = idx
-        acc_body = ""
-        while end_idx < n:
-            pnum, ptext = pages[end_idx]
-            sep = "\n\n" if acc_body else ""
-            trial_body = acc_body + sep + f"## Página {pnum}\n\n{ptext}"
-            if (
-                _window_tokens_for_body(
-                    start_p, pnum, trial_body, overhead_reserve=overhead_reserve
-                )
-                > budget_tokens
-            ):
-                break
-            acc_body = trial_body
-            end_idx += 1
+        chunk = pages[idx : idx + max_pages]
+        if not chunk:
+            break
+        start_p = chunk[0][0]
+        end_p = chunk[-1][0]
+        body = "\n\n".join(f"## Página {pnum}\n\n{ptext}" for pnum, ptext in chunk)
+        out.append((start_p, end_p, body))
+        idx += step
+    return out
 
-        if end_idx == idx:
-            pnum, ptext = pages[idx]
-            inner_overhead = count_tokens(
-                f"{SUMMARY_CORNELL_USER_PREFIX}\n\n"
-                + SUMMARY_WINDOW_WRAPPER.format(start=pnum, end=pnum, body="")
-            )
-            room = max(256, budget_tokens - inner_overhead - overhead_reserve)
-            pieces = chunk_text_by_tokens(ptext, room)
-            for k, piece in enumerate(pieces):
-                label = f"## Página {pnum} (parte {k + 1}/{len(pieces)})\n\n{piece}"
-                windows.append((pnum, pnum, label))
-            idx += 1
-            continue
 
-        end_p = pages[end_idx - 1][0]
-        windows.append((start_p, end_p, acc_body))
-        idx = max(idx + 1, end_idx - max(0, overlap))
-    return windows
+def _chunk_single_page_if_needed(
+    pnum: int, ptext: str, *, safety_margin: int = 200
+) -> list[tuple[int, int, str]]:
+    base_wrapper = SUMMARY_WINDOW_WRAPPER.format(start=pnum, end=pnum, body="")
+    base_tokens = count_tokens(f"{SUMMARY_CORNELL_USER_PREFIX}\n\n{base_wrapper}")
+    ratio = app_state.get_adaptive_prompt_ratio()
+    max_prompt = max(512, int(app_state.MAX_CONTEXT_TOKENS * ratio))
+    room = max(256, max_prompt - base_tokens - safety_margin)
+    chunks = chunk_text_by_tokens(ptext, room)
+    if len(chunks) <= 1:
+        return [(pnum, pnum, f"## Página {pnum}\n\n{ptext}")]
+    out: list[tuple[int, int, str]] = []
+    total = len(chunks)
+    for i, piece in enumerate(chunks, start=1):
+        out.append((pnum, pnum, f"## Página {pnum} (parte {i}/{total})\n\n{piece}"))
+    return out
 
 
 def _normalize_topic_title(title: str) -> str:
@@ -239,41 +204,13 @@ def _chat_cornell_window(
     return completion_parsed_or_validate(completion, CornellSummaryStructured)
 
 
-def unify_assembled_cornell_markdown(
-    assembled_md: str, *, h1_title: str = "Resumen"
-) -> str:
-    """Segunda pasada LLM: fusiona temas, elimina redundancias y reordena."""
-    user_content = UNIFY_ASSEMBLED_CORNELL_PROMPT.format(combined=assembled_md)
-    if count_tokens(user_content) > app_state.MAX_INPUT_TOKENS:
-        print(
-            "Aviso: consolidación final omitida (prompt supera MAX_INPUT_TOKENS). "
-            "Reduzca el documento o suba el límite en LM Studio."
-        )
-        return assembled_md
-    try:
-        structured = _chat_cornell_structured(user_content)
-        if not structured.topics:
-            return assembled_md
-        return format_cornell_structured_with_index(structured, h1_title=h1_title)
-    except Exception as ex:
-        print(f"Consolidación final falló; se mantiene el ensamblado de ventanas: {ex}")
-        return assembled_md
-
-
 def summarize_document_paged_windows(
     full_text: str,
     *,
     partials_dir: Path | None = None,
     h1_title: str = "Resumen",
 ) -> str:
-    """
-    Resumen Cornell por ventanas de páginas (presupuesto + solape); ensamblado y, por defecto,
-    consolidación final con el modelo (``SUMMARIZER_POST_UNIFY``).
-
-    Si ``partials_dir`` está definido y SUMMARIZER_SUMMARY_PARTIALS no desactiva la función,
-    cada ventana se guarda en ``window_NNNN.json`` (reanudable si el contenido de la ventana
-    no cambia). El Markdown final es el mismo que sin checkpoints.
-    """
+    """Resumen Cornell por ventanas de páginas (máximo fijo por ventana, con fallback 2/1)."""
     pages = split_markdown_by_page_headers(full_text)
     if not pages:
         return ""
@@ -286,18 +223,18 @@ def summarize_document_paged_windows(
             "entorno o índice detectado en el texto."
         )
 
-    budget = _summary_window_token_budget()
+    max_pages_per_window = max(1, SUMMARY_MAX_PAGES_PER_WINDOW)
     print(
         f"Resumen por ventanas: {len(pages)} páginas detectadas; "
-        f"presupuesto ~{budget} tokens; solape {SUMMARY_PAGE_OVERLAP} páginas."
+        f"máximo {max_pages_per_window} páginas/ventana; solape {SUMMARY_PAGE_OVERLAP} páginas."
     )
-
     strict = _strict_one_page_from_env()
+    if strict:
+        max_pages_per_window = 1
     windows = build_page_windows(
         pages,
         overlap=SUMMARY_PAGE_OVERLAP,
-        budget_tokens=budget,
-        strict_one_page=strict,
+        max_pages_per_window=max_pages_per_window,
     )
     if not windows:
         return ""
@@ -313,7 +250,7 @@ def summarize_document_paged_windows(
                     "version": 1,
                     "page_count": len(pages),
                     "window_count": len(windows),
-                    "budget_tokens": budget,
+                    "max_pages_per_window": max_pages_per_window,
                     "overlap": SUMMARY_PAGE_OVERLAP,
                     "strict_one_page": strict,
                 },
@@ -323,6 +260,53 @@ def summarize_document_paged_windows(
             encoding="utf-8",
         )
         os.replace(man_tmp, man_path)
+
+    def summarize_with_fallback(
+        sp: int, ep: int, body: str
+    ) -> tuple[int, int, CornellSummaryStructured]:
+        page_count = len(split_markdown_by_page_headers(body))
+        try:
+            structured = _chat_cornell_window(
+                sp, ep, body, chapter_outline=chapter_outline
+            )
+            return sp, ep, structured
+        except BadRequestError as ex:
+            if not is_context_overflow_error(ex):
+                raise
+            app_state.record_prompt_ratio_overflow()
+            if page_count > 1:
+                print(
+                    f"Overflow en páginas {sp}-{ep}; reintentando con menor granularidad."
+                )
+                parsed = split_markdown_by_page_headers(body)
+                next_max_pages = max(1, page_count - 1)
+                retry_windows = build_page_windows(
+                    parsed, overlap=0, max_pages_per_window=next_max_pages
+                )
+                merged_topics: list[CornellTopicBlock] = []
+                retry_start = retry_windows[0][0] if retry_windows else sp
+                retry_end = retry_windows[-1][1] if retry_windows else ep
+                for rsp, rep, rbody in retry_windows:
+                    _, _, partial = summarize_with_fallback(rsp, rep, rbody)
+                    merged_topics.extend(partial.topics)
+                return (
+                    retry_start,
+                    retry_end,
+                    CornellSummaryStructured(topics=merged_topics),
+                )
+            parsed_page = split_markdown_by_page_headers(body)
+            if not parsed_page:
+                raise
+            pnum, ptext = parsed_page[0]
+            chunked = _chunk_single_page_if_needed(pnum, ptext)
+            if len(chunked) <= 1:
+                raise
+            print(f"Overflow en página {pnum}; reintentando por fragmentos internos.")
+            merged_topics: list[CornellTopicBlock] = []
+            for csp, cep, cbody in chunked:
+                _, _, partial = summarize_with_fallback(csp, cep, cbody)
+                merged_topics.extend(partial.topics)
+            return sp, ep, CornellSummaryStructured(topics=merged_topics)
 
     def run_window(
         task_i: int, triplet: tuple[int, int, str]
@@ -340,28 +324,18 @@ def summarize_document_paged_windows(
             )
             if cached is not None:
                 return task_i, (sp, ep, cached)
-        try:
-            structured = _chat_cornell_window(
-                sp, ep, body, chapter_outline=chapter_outline
-            )
-        except BadRequestError as ex:
-            if is_context_overflow_error(ex):
-                app_state.record_prompt_ratio_overflow()
-            raise
+        _, _, structured = summarize_with_fallback(sp, ep, body)
         if part_path is not None:
             save_window_checkpoint(
                 part_path, start_p=sp, end_p=ep, body=body, structured=structured
             )
         return task_i, (sp, ep, structured)
 
-    workers = min(MAX_PARALLEL_WINDOW_SUMMARIES, len(windows))
     results: dict[int, tuple[int, int, CornellSummaryStructured]] = {}
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futs = [pool.submit(run_window, i, w) for i, w in enumerate(windows)]
-        for fut in as_completed(futs):
-            check_stop_requested()
-            i, triple = fut.result()
-            results[i] = triple
+    for i, w in enumerate(windows):
+        check_stop_requested()
+        idx, triple = run_window(i, w)
+        results[idx] = triple
 
     ordered_struct = [results[i] for i in range(len(windows))]
     combined_md_path = (
@@ -370,9 +344,6 @@ def summarize_document_paged_windows(
         else None
     )
     md = assemble_cornell_windows_markdown(ordered_struct, h1_title=h1_title)
-    if POST_UNIFY_ENABLED and md.strip():
-        print("Consolidación final del resumen (fusionar temas, alinear índice)…")
-        md = unify_assembled_cornell_markdown(md, h1_title=h1_title)
     if combined_md_path is not None and md.strip():
         atomic_write_text(combined_md_path, md)
     if md.strip():

@@ -30,6 +30,8 @@ from summarizer.prompts import OCR_PROMPT
 from summarizer.stop import check_stop_requested
 from summarizer.word_conversion import extract_docx_text
 
+MAX_OCR_PAGES_PER_REQUEST = 2
+
 
 def extract_text_get_text_only(pdf_path: Path) -> str:
     parts: list[str] = []
@@ -76,6 +78,18 @@ def _ocr_page_body_or_empty(src: Path, page_index: int) -> str:
         return ""
 
 
+def _ocr_pages_group(src: Path, page_indexes: list[int]) -> dict[int, str]:
+    """
+    Procesa un grupo de páginas con límite estricto por consulta.
+    Implementación actual: una consulta por página (1 <= 2), manteniendo compatibilidad.
+    """
+    safe_indexes = page_indexes[:MAX_OCR_PAGES_PER_REQUEST]
+    out: dict[int, str] = {}
+    for i in safe_indexes:
+        out[i] = _ocr_page_body_or_empty(src, i)
+    return out
+
+
 def extract_vision_pdf_incremental(src: Path, out_path: Path) -> None:
     """OCR de páginas en paralelo; escribe el .md al avanzar el prefijo consecutivo (atómico, reanudable)."""
     with pymupdf.open(src) as pdf:
@@ -111,7 +125,7 @@ def extract_vision_pdf_incremental(src: Path, out_path: Path) -> None:
 
     print(
         f"OCR vis {src.name}: páginas {start_i + 1}..{n} de {n} "
-        f"(paralelo ≤{MAX_PARALLEL_OCR_PAGES})"
+        f"(paralelo ≤{MAX_PARALLEL_OCR_PAGES}, max {MAX_OCR_PAGES_PER_REQUEST} pág/consulta)"
     )
     if start_i >= n:
         atomic_write_text(out_path, "\n\n".join(chunks_prefix))
@@ -134,16 +148,21 @@ def extract_vision_pdf_incremental(src: Path, out_path: Path) -> None:
     workers = min(MAX_PARALLEL_OCR_PAGES, len(pending))
     workers = max(1, workers)
 
-    def run_page(i: int) -> tuple[int, str]:
-        return i, _ocr_page_body_or_empty(src, i)
+    def run_page_group(group: list[int]) -> dict[int, str]:
+        return _ocr_pages_group(src, group)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(run_page, i): i for i in pending}
+        groups = [
+            pending[i : i + MAX_OCR_PAGES_PER_REQUEST]
+            for i in range(0, len(pending), MAX_OCR_PAGES_PER_REQUEST)
+        ]
+        futures = [pool.submit(run_page_group, g) for g in groups]
         for fut in as_completed(futures):
             check_stop_requested()
-            i, text = fut.result()
+            batch = fut.result()
             with write_lock:
-                page_bodies[i] = text
+                for i, text in sorted(batch.items()):
+                    page_bodies[i] = text
                 try_flush_extended_locked()
 
     with write_lock:

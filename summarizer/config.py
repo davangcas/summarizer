@@ -55,6 +55,10 @@ MAX_PARALLEL_CHUNKS = env_int("SUMMARIZER_MAX_PARALLEL_CHUNKS", 4)
 MAX_PARALLEL_OCR_PAGES = env_int("SUMMARIZER_MAX_PARALLEL_OCR_PAGES", 4)
 MAX_PARALLEL_WINDOW_SUMMARIES = env_int("SUMMARIZER_MAX_PARALLEL_WINDOW_SUMMARIES", 2)
 SUMMARY_PAGE_OVERLAP = env_int("SUMMARIZER_SUMMARY_PAGE_OVERLAP", 1)
+SUMMARY_MAX_PAGES_PER_WINDOW = env_int("SUMMARIZER_SUMMARY_MAX_PAGES_PER_WINDOW", 3)
+SUMMARY_RETRY_MAX_PAGES_STEPDOWN = env_int(
+    "SUMMARIZER_SUMMARY_RETRY_MAX_PAGES_STEPDOWN", 1
+)
 ASSEMBLE_DEDUP_BORDER = os.environ.get(
     "SUMMARIZER_ASSEMBLE_DEDUP_BORDER", ""
 ).strip().lower() in ("1", "true", "yes", "sí", "si", "on")
@@ -71,8 +75,6 @@ def env_flag(name: str, *, default: bool) -> bool:
     return default
 
 
-# Tras ensamblar ventanas, una pasada LLM fusiona temas y limpia el índice (salvo límite de tokens).
-POST_UNIFY_ENABLED = env_flag("SUMMARIZER_POST_UNIFY", default=True)
 # Heurística de índice del libro en las primeras páginas (INDICE + líneas con puntos guía).
 BOOK_OUTLINE_HEURISTIC_ENABLED = env_flag(
     "SUMMARIZER_BOOK_OUTLINE_HEURISTIC", default=True
