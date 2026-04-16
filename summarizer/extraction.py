@@ -1,4 +1,4 @@
-"""Extracción de texto desde PDF (nativo o visión / OCR)."""
+"""Extracción de texto desde documentos fuente (PDF y Word)."""
 
 from __future__ import annotations
 
@@ -21,13 +21,14 @@ from summarizer.markdown_utils import (
 )
 from summarizer.models import OCRPageOutput
 from summarizer.output import (
-    completed_md_path_for_pdf,
+    completed_md_path_for_source,
     maybe_write_completed_texts_ocr_clone_pdf,
     nonempty_utf8_file,
     write_completed_text,
 )
 from summarizer.prompts import OCR_PROMPT
 from summarizer.stop import check_stop_requested
+from summarizer.word_conversion import extract_docx_text
 
 
 def extract_text_get_text_only(pdf_path: Path) -> str:
@@ -160,53 +161,88 @@ def _completed_md_needs_page_markers(out_md: Path) -> bool:
     return not PAGE_HEADER_START_RE.search(txt)
 
 
-def _extract_single_pdf(src: Path) -> None:
-    """Un PDF por tarea (hilo): abre su propio documento; no compartir fitz entre hilos."""
+def _extract_single_pdf_for_source(src_pdf: Path, src_for_output: Path) -> None:
+    """Procesa un PDF y escribe salida usando la ruta del archivo fuente."""
     try:
         check_stop_requested()
-        print(src)
-        out_md = completed_md_path_for_pdf(src)
-        if pdf_has_selectable_text(src):
-            file_text = extract_text_get_text_only(src)
-            write_completed_text(src, file_text)
+        print(src_for_output)
+        out_md = completed_md_path_for_source(src_for_output)
+        if pdf_has_selectable_text(src_pdf):
+            file_text = extract_text_get_text_only(src_pdf)
+            write_completed_text(src_for_output, file_text)
         elif app_state.use_vision_for_scanned_pdfs:
-            extract_vision_pdf_incremental(src, out_md)
-            maybe_write_completed_texts_ocr_clone_pdf(src)
+            extract_vision_pdf_incremental(src_pdf, out_md)
+            if src_for_output.suffix.lower() == ".pdf":
+                maybe_write_completed_texts_ocr_clone_pdf(src_for_output)
         else:
             print(
-                f"Sin texto extraíble (get_text vacío); visión desactivada — omitido: {src}"
+                "Sin texto extraíble (get_text vacío); visión desactivada — "
+                f"omitido: {src_for_output}"
             )
     except Exception as ex:
-        print(f"Error processing {src}: {ex}")
+        print(f"Error processing {src_for_output}: {ex}")
 
 
-def run_pdf_extraction() -> None:
-    """Idempotent: skips PDFs that already have a non-empty completed_texts .md."""
+def _extract_single_source(src: Path) -> None:
+    suffix = src.suffix.lower()
+    if suffix == ".pdf":
+        _extract_single_pdf_for_source(src, src)
+        return
+    if suffix == ".docx":
+        try:
+            text = extract_docx_text(src)
+            if text.strip():
+                write_completed_text(src, text)
+                return
+            print(f"Omitido {src}: DOCX sin contenido de texto extraíble.")
+            return
+        except Exception as ex:
+            print(f"Omitido {src}: error extrayendo DOCX ({ex})")
+            return
+    if suffix == ".doc":
+        print(
+            f"Omitido {src}: formato .doc no soportado en modo solo-Python. "
+            "Convierta el archivo a .docx."
+        )
+        return
+
+
+def run_document_extraction() -> None:
+    """Idempotent para documentos soportados (.pdf/.docx/.doc)."""
     assert app_state.files_directory is not None
     check_stop_requested()
     pending: list[Path] = []
+    supported = {".pdf", ".docx", ".doc"}
     for root, _, files in os.walk(app_state.files_directory):
         for file in files:
-            if not file.endswith(".pdf"):
+            suffix = Path(file).suffix.lower()
+            if suffix not in supported:
                 continue
             src = Path(root) / file
-            if not app_state.source_pdf_is_in_scope(src):
+            if not app_state.source_file_is_in_scope(src):
                 continue
-            out_md = completed_md_path_for_pdf(src)
-            if nonempty_utf8_file(out_md) and not _completed_md_needs_page_markers(
+            out_md = completed_md_path_for_source(src)
+            needs_markers = suffix == ".pdf" and _completed_md_needs_page_markers(
                 out_md
-            ):
+            )
+            if nonempty_utf8_file(out_md) and not needs_markers:
                 print(f"Skip extract (already in completed_texts): {src}")
-                maybe_write_completed_texts_ocr_clone_pdf(src)
+                if suffix == ".pdf":
+                    maybe_write_completed_texts_ocr_clone_pdf(src)
                 continue
-            if _completed_md_needs_page_markers(out_md):
+            if needs_markers:
                 print(f"Re-extracción (marcadores de página): {src}")
             pending.append(src)
     if not pending:
         return
     workers = min(MAX_PARALLEL_PDFS, len(pending))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_extract_single_pdf, p) for p in pending]
+        futures = [pool.submit(_extract_single_source, p) for p in pending]
         for fut in as_completed(futures):
             check_stop_requested()
             fut.result()
+
+
+def run_pdf_extraction() -> None:
+    """Compat: alias hacia el runner general de documentos."""
+    run_document_extraction()

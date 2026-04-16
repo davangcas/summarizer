@@ -25,10 +25,15 @@ def summary_pdfs_output_dir() -> Path:
     return base if base is not None else paths.summary_pdfs
 
 
-def completed_md_path_for_pdf(src: Path) -> Path:
+def completed_md_path_for_source(src: Path) -> Path:
     assert app_state.files_directory is not None
     rel = src.relative_to(app_state.files_directory)
     return paths.completed_texts / rel.with_suffix(".md")
+
+
+def completed_md_path_for_pdf(src: Path) -> Path:
+    """Compat: mantener nombre anterior para llamadas legacy."""
+    return completed_md_path_for_source(src)
 
 
 def completed_texts_ocr_pdf_path_for_pdf(src: Path) -> Path:
@@ -47,7 +52,7 @@ def maybe_write_completed_texts_ocr_clone_pdf(src: Path) -> None:
         return
     if not app_state.use_vision_for_scanned_pdfs:
         return
-    out_md = completed_md_path_for_pdf(src)
+    out_md = completed_md_path_for_source(src)
     if not nonempty_utf8_file(out_md):
         return
     ocr_pdf = completed_texts_ocr_pdf_path_for_pdf(src)
@@ -74,7 +79,7 @@ def nonempty_pdf_file(path: Path) -> bool:
 
 
 def write_completed_text(src: Path, file_text: str) -> None:
-    out_path = completed_md_path_for_pdf(src)
+    out_path = completed_md_path_for_source(src)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(file_text, encoding="utf-8")
 

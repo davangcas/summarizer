@@ -1,4 +1,4 @@
-"""Configuración inicial: carpeta de PDFs y preferencia de visión OCR."""
+"""Configuración inicial: carpeta/archivos fuente y preferencia de visión OCR."""
 
 from __future__ import annotations
 
@@ -33,29 +33,27 @@ def _split_env_path_list(raw: str) -> list[str]:
     return parts if parts else [s]
 
 
-def _parse_env_pdf_files_list(raw: str) -> list[Path]:
+def _parse_env_source_files_list(raw: str, env_name: str) -> list[Path]:
     out: list[Path] = []
     for s in _split_env_path_list(raw):
         p = Path(s).expanduser().resolve()
         if not p.is_file():
-            raise SystemExit(f"SUMMARIZER_PDF_FILES: no es un archivo válido: {p}")
-        if p.suffix.lower() != ".pdf":
-            raise SystemExit(f"SUMMARIZER_PDF_FILES: se esperaba .pdf: {p}")
+            raise SystemExit(f"{env_name}: no es un archivo válido: {p}")
         out.append(p)
     if not out:
-        raise SystemExit("SUMMARIZER_PDF_FILES no contiene rutas válidas.")
+        raise SystemExit(f"{env_name} no contiene rutas válidas.")
     return out
 
 
 def _configure_source_directory_gui() -> None:
-    """Ventana con dos acciones: carpeta (todos los PDF recursivos) o archivos concretos."""
+    """Ventana con dos acciones: carpeta (todos los documentos) o archivos concretos."""
     import tkinter as tk
     from tkinter import filedialog, ttk
 
     choice: dict[str, str | None] = {"kind": None}
 
     root = tk.Tk()
-    root.title("Origen de los PDF")
+    root.title("Origen de archivos")
     root.resizable(False, False)
     root.attributes("-topmost", True)
 
@@ -65,8 +63,9 @@ def _configure_source_directory_gui() -> None:
     ttk.Label(
         frm,
         text=(
-            "Carpeta: se procesan todos los .pdf dentro (subcarpetas incluidas).\n"
-            "Archivos: solo los PDF que elija."
+            "Carpeta: se procesan todos los archivos soportados dentro\n"
+            "(subcarpetas incluidas).\n"
+            "Archivos: solo los archivos que elija."
         ),
         justify=tk.CENTER,
     ).pack(pady=(0, 14))
@@ -91,7 +90,7 @@ def _configure_source_directory_gui() -> None:
     btn_f.pack(fill=tk.X, pady=4)
     btn_a = ttk.Button(
         frm,
-        text="Elegir archivos PDF…",
+        text="Elegir archivos…",
         command=on_files,
     )
     btn_a.pack(fill=tk.X, pady=4)
@@ -116,29 +115,30 @@ def _configure_source_directory_gui() -> None:
     try:
         if kind == "folder":
             chosen = filedialog.askdirectory(
-                title="Seleccione la carpeta con los PDF a procesar",
+                title="Seleccione la carpeta con los archivos a procesar",
                 parent=dlg,
             )
             if not chosen:
                 raise SystemExit("No se seleccionó ninguna carpeta.")
             app_state.files_directory = Path(chosen).resolve()
-            app_state.source_pdf_paths = None
+            app_state.source_file_paths = None
             print(
-                f"Carpeta origen (todos los PDF en el árbol): {app_state.files_directory}"
+                "Carpeta origen (todos los archivos soportados en el árbol): "
+                f"{app_state.files_directory}"
             )
             return
 
         file_tuples = filedialog.askopenfilenames(
-            title="Seleccione uno o varios archivos PDF",
-            filetypes=[("PDF", "*.pdf"), ("Todos", "*.*")],
+            title="Seleccione uno o varios archivos",
+            filetypes=[("Todos", "*.*")],
             parent=dlg,
         )
         if not file_tuples:
             raise SystemExit("No se seleccionó ningún archivo.")
-        pdfs = [Path(f).resolve() for f in file_tuples]
-        app_state.files_directory = _common_ancestor_directory(pdfs)
-        app_state.source_pdf_paths = frozenset(pdfs)
-        print(f"Archivos PDF seleccionados: {len(app_state.source_pdf_paths)}")
+        source_files = [Path(f).resolve() for f in file_tuples]
+        app_state.files_directory = _common_ancestor_directory(source_files)
+        app_state.source_file_paths = frozenset(source_files)
+        print(f"Archivos seleccionados: {len(app_state.source_file_paths)}")
         print(f"Carpeta base derivada: {app_state.files_directory}")
     finally:
         dlg.destroy()
@@ -146,19 +146,25 @@ def _configure_source_directory_gui() -> None:
 
 def configure_source_directory() -> None:
     """
-    Asigna ``files_directory`` y opcionalmente ``source_pdf_paths``.
+    Asigna ``files_directory`` y opcionalmente ``source_file_paths``.
 
     Entorno:
-    - ``SUMMARIZER_PDF_FILES``: uno o varios PDF; separador ``;`` o, en Unix,
-      ``:`` (``os.pathsep``). Se deriva la carpeta base y solo se procesan esos archivos.
-    - ``SUMMARIZER_FILES_DIRECTORY``: carpeta; se procesan todos los ``.pdf`` bajo ella (recursivo).
+    - ``SUMMARIZER_SOURCE_FILES``: uno o varios archivos; separador ``;`` o,
+      en Unix, ``:`` (``os.pathsep``). Se deriva la carpeta base y solo se procesan esos archivos.
+    - ``SUMMARIZER_PDF_FILES``: compatibilidad retroactiva (mismo formato).
+    - ``SUMMARIZER_FILES_DIRECTORY``: carpeta; se procesan todos los archivos
+      soportados bajo ella (recursivo).
     """
-    env_files = os.environ.get("SUMMARIZER_PDF_FILES", "").strip()
+    env_files = os.environ.get("SUMMARIZER_SOURCE_FILES", "").strip()
+    env_name = "SUMMARIZER_SOURCE_FILES"
+    if not env_files:
+        env_files = os.environ.get("SUMMARIZER_PDF_FILES", "").strip()
+        env_name = "SUMMARIZER_PDF_FILES"
     if env_files:
-        pdfs = _parse_env_pdf_files_list(env_files)
-        app_state.files_directory = _common_ancestor_directory(pdfs)
-        app_state.source_pdf_paths = frozenset(p.resolve() for p in pdfs)
-        print(f"PDF indicados (entorno): {len(app_state.source_pdf_paths)} archivo(s)")
+        source_files = _parse_env_source_files_list(env_files, env_name)
+        app_state.files_directory = _common_ancestor_directory(source_files)
+        app_state.source_file_paths = frozenset(p.resolve() for p in source_files)
+        print(f"Archivos indicados (entorno): {len(app_state.source_file_paths)}")
         print(f"Carpeta base derivada: {app_state.files_directory}")
         return
 
@@ -170,13 +176,14 @@ def configure_source_directory() -> None:
                 f"SUMMARIZER_FILES_DIRECTORY no es una carpeta válida: {p}"
             )
         app_state.files_directory = p
-        app_state.source_pdf_paths = None
+        app_state.source_file_paths = None
         print(f"Carpeta origen (entorno): {app_state.files_directory}")
         return
     if importlib.util.find_spec("tkinter") is None:
         raise SystemExit(
             "No se pudo cargar tkinter para elegir origen. "
-            "Instale tk o defina SUMMARIZER_FILES_DIRECTORY o SUMMARIZER_PDF_FILES."
+            "Instale tk o defina SUMMARIZER_FILES_DIRECTORY, "
+            "SUMMARIZER_SOURCE_FILES o SUMMARIZER_PDF_FILES."
         )
     _configure_source_directory_gui()
 

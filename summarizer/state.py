@@ -13,27 +13,30 @@ from summarizer.config import (
 )
 
 files_directory: pathlib.Path | None = None
-# Si no es None, solo se procesan estos PDF (rutas absolutas resueltas).
-source_pdf_paths: frozenset[pathlib.Path] | None = None
+# Si no es None, solo se procesan estos archivos fuente (rutas absolutas resueltas).
+source_file_paths: frozenset[pathlib.Path] | None = None
 # Carpeta para los PDF de resumen finales; None = usar ``paths.summary_pdfs`` del proyecto.
 summary_pdfs_directory: pathlib.Path | None = None
 use_vision_for_scanned_pdfs: bool = False
 
 
-def source_pdf_is_in_scope(pdf_path: pathlib.Path) -> bool:
-    """True si el PDF debe procesarse según ``source_pdf_paths`` (o todos si es None)."""
-    if source_pdf_paths is None:
+def source_file_is_in_scope(source_path: pathlib.Path) -> bool:
+    """True si el archivo fuente debe procesarse según ``source_file_paths``."""
+    if source_file_paths is None:
         return True
-    return pdf_path.resolve() in source_pdf_paths
+    return source_path.resolve() in source_file_paths
 
 
 def completed_rel_matches_source_filter(rel: pathlib.Path) -> bool:
-    """True si el .md bajo completed_texts corresponde a un PDF seleccionado."""
+    """True si el .md bajo completed_texts corresponde a un archivo fuente seleccionado."""
     assert files_directory is not None
-    if source_pdf_paths is None:
+    if source_file_paths is None:
         return True
-    expected_pdf = (files_directory / rel).with_suffix(".pdf").resolve()
-    return expected_pdf in source_pdf_paths
+    source_base = (files_directory / rel).with_suffix("")
+    for suffix in (".pdf", ".docx", ".doc"):
+        if source_base.with_suffix(suffix).resolve() in source_file_paths:
+            return True
+    return False
 
 
 completion_model: str = ""
