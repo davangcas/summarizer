@@ -1,172 +1,107 @@
-"""Extracción de texto desde documentos fuente (PDF y Word)."""
+"""Extracción de texto desde documentos fuente vía MarkItDown + pymupdf4llm."""
 
 from __future__ import annotations
 
-import base64
 import os
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pymupdf
+import pymupdf4llm
 
 from summarizer import state as app_state
-from summarizer.config import MAX_PARALLEL_OCR_PAGES, MAX_PARALLEL_PDFS
-from summarizer.fs import atomic_write_text
-from summarizer.llm import chat_parse_with_retry, completion_parsed_or_validate
-from summarizer.markdown_utils import (
-    PAGE_HEADER_START_RE,
-    pdf_has_selectable_text,
-    split_markdown_by_page_headers,
-)
-from summarizer.models import OCRPageOutput
+from summarizer.config import MAX_PARALLEL_PDFS
+from summarizer.markdown_utils import PAGE_HEADER_START_RE
 from summarizer.output import (
     completed_md_path_for_source,
     maybe_write_completed_texts_ocr_clone_pdf,
     nonempty_utf8_file,
     write_completed_text,
 )
-from summarizer.prompts import OCR_PROMPT
+from summarizer.progress import get_global_progress, progress_log
 from summarizer.stop import check_stop_requested
-from summarizer.word_conversion import extract_docx_text
 
-MAX_OCR_PAGES_PER_REQUEST = 2
+_MARKITDOWN_EXTENSIONS = frozenset(
+    {
+        ".docx",
+        ".pptx",
+        ".xlsx",
+        ".xls",
+        ".html",
+        ".htm",
+        ".csv",
+        ".json",
+        ".xml",
+        ".epub",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".bmp",
+        ".tiff",
+        ".tif",
+        ".webp",
+        ".mp3",
+        ".wav",
+        ".zip",
+        ".msg",
+        ".rst",
+    }
+)
+
+SUPPORTED_EXTENSIONS = frozenset({".pdf"}) | _MARKITDOWN_EXTENSIONS
+
+_markitdown_instance = None
+
+
+def _get_markitdown():
+    global _markitdown_instance
+    if _markitdown_instance is None:
+        from markitdown import MarkItDown
+
+        if app_state.completion_model:
+            from summarizer.llm import client as openai_client
+
+            _markitdown_instance = MarkItDown(
+                enable_plugins=True,
+                llm_client=openai_client,
+                llm_model=app_state.completion_model,
+            )
+        else:
+            _markitdown_instance = MarkItDown(enable_plugins=False)
+    return _markitdown_instance
+
+
+def _convert_with_markitdown(src: Path) -> str:
+    """Conversión unificada vía MarkItDown (DOCX, PPTX, XLSX, HTML, PDF escaneado, …)."""
+    result = _get_markitdown().convert(str(src))
+    return result.text_content
 
 
 def extract_text_get_text_only(pdf_path: Path) -> str:
-    parts: list[str] = []
-    with pymupdf.open(pdf_path) as pdf:
-        for i, page in enumerate(pdf):
-            text = page.get_text().strip()
-            parts.append(f"## Página {i + 1}\n\n{text}")
-    return "\n\n".join(parts)
-
-
-def _ocr_single_page(pdf_path: Path, page_index: int) -> str:
-    """Abre el PDF en el hilo actual; una página por llamada (seguro en paralelo)."""
-    mat = pymupdf.Matrix(2, 2)
-    with pymupdf.open(pdf_path) as pdf:
-        page = pdf[page_index]
-        pix = page.get_pixmap(matrix=mat)
-        png_bytes = pix.tobytes("png")
-        b64 = base64.standard_b64encode(png_bytes).decode("ascii")
-        data_url = f"data:image/png;base64,{b64}"
-        completion = chat_parse_with_retry(
-            model=app_state.completion_model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": OCR_PROMPT},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": data_url},
-                        },
-                    ],
-                }
-            ],
-            response_format=OCRPageOutput,
-        )
-        return completion_parsed_or_validate(completion, OCRPageOutput).markdown_text
-
-
-def _ocr_page_body_or_empty(src: Path, page_index: int) -> str:
+    """Extrae Markdown estructurado de un PDF con texto seleccionable (por página)."""
     try:
-        return _ocr_single_page(src, page_index).strip()
-    except Exception as ex:
-        print(f"OCR error página {page_index + 1} de {src}: {ex}")
-        return ""
+        page_chunks = pymupdf4llm.to_markdown(str(pdf_path), page_chunks=True)
+        parts: list[str] = []
+        for i, chunk in enumerate(page_chunks):
+            text = chunk.get("text", "").strip()
+            parts.append(f"## Página {i + 1}\n\n{text}")
+        return "\n\n".join(parts)
+    except Exception:
+        parts: list[str] = []
+        with pymupdf.open(pdf_path) as pdf:
+            for i, page in enumerate(pdf):
+                text = page.get_text().strip()
+                parts.append(f"## Página {i + 1}\n\n{text}")
+        return "\n\n".join(parts)
 
 
-def _ocr_pages_group(src: Path, page_indexes: list[int]) -> dict[int, str]:
-    """
-    Procesa un grupo de páginas con límite estricto por consulta.
-    Implementación actual: una consulta por página (1 <= 2), manteniendo compatibilidad.
-    """
-    safe_indexes = page_indexes[:MAX_OCR_PAGES_PER_REQUEST]
-    out: dict[int, str] = {}
-    for i in safe_indexes:
-        out[i] = _ocr_page_body_or_empty(src, i)
-    return out
-
-
-def extract_vision_pdf_incremental(src: Path, out_path: Path) -> None:
-    """OCR de páginas en paralelo; escribe el .md al avanzar el prefijo consecutivo (atómico, reanudable)."""
-    with pymupdf.open(src) as pdf:
-        n = len(pdf)
-    if n == 0:
-        atomic_write_text(out_path, "")
-        return
-
-    existing = ""
-    if out_path.is_file():
-        existing = out_path.read_text(encoding="utf-8", errors="replace")
-
-    page_bodies: dict[int, str] = {}
-    chunks_prefix: list[str] = []
-    start_i = 0
-    if existing.strip():
-        if not PAGE_HEADER_START_RE.search(existing):
-            print(f"OCR reinicio (sin marcadores de página previos): {src.name}")
-            page_bodies.clear()
-            chunks_prefix.clear()
-            start_i = 0
-        else:
-            parsed = split_markdown_by_page_headers(existing)
-            if len(parsed) >= n:
-                print(f"OCR ya completo ({n} páginas): {src.name}")
-                return
-            for pnum, body in parsed:
-                idx = int(pnum) - 1
-                body = body.strip()
-                page_bodies[idx] = body
-                chunks_prefix.append(f"## Página {pnum}\n\n{body}")
-            start_i = len(parsed)
-
-    print(
-        f"OCR vis {src.name}: páginas {start_i + 1}..{n} de {n} "
-        f"(paralelo ≤{MAX_PARALLEL_OCR_PAGES}, max {MAX_OCR_PAGES_PER_REQUEST} pág/consulta)"
-    )
-    if start_i >= n:
-        atomic_write_text(out_path, "\n\n".join(chunks_prefix))
-        return
-    check_stop_requested()
-
-    written_len = start_i
-    write_lock = threading.Lock()
-
-    def try_flush_extended_locked() -> None:
-        nonlocal written_len
-        while written_len < n and written_len in page_bodies:
-            b = page_bodies[written_len]
-            chunks_prefix.append(f"## Página {written_len + 1}\n\n{b}")
-            written_len += 1
-        if chunks_prefix:
-            atomic_write_text(out_path, "\n\n".join(chunks_prefix))
-
-    pending = [i for i in range(start_i, n) if i not in page_bodies]
-    workers = min(MAX_PARALLEL_OCR_PAGES, len(pending))
-    workers = max(1, workers)
-
-    def run_page_group(group: list[int]) -> dict[int, str]:
-        return _ocr_pages_group(src, group)
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        groups = [
-            pending[i : i + MAX_OCR_PAGES_PER_REQUEST]
-            for i in range(0, len(pending), MAX_OCR_PAGES_PER_REQUEST)
-        ]
-        futures = [pool.submit(run_page_group, g) for g in groups]
-        for fut in as_completed(futures):
-            check_stop_requested()
-            batch = fut.result()
-            with write_lock:
-                for i, text in sorted(batch.items()):
-                    page_bodies[i] = text
-                try_flush_extended_locked()
-
-    with write_lock:
-        try_flush_extended_locked()
+def _pdf_all_pages_have_text(pdf_path: Path) -> bool:
+    """True si todas las páginas del PDF tienen texto seleccionable."""
+    with pymupdf.open(pdf_path) as pdf:
+        if len(pdf) == 0:
+            return False
+        return all(page.get_text().strip() for page in pdf)
 
 
 def _completed_md_needs_page_markers(out_md: Path) -> bool:
@@ -184,22 +119,34 @@ def _extract_single_pdf_for_source(src_pdf: Path, src_for_output: Path) -> None:
     """Procesa un PDF y escribe salida usando la ruta del archivo fuente."""
     try:
         check_stop_requested()
-        print(src_for_output)
-        out_md = completed_md_path_for_source(src_for_output)
-        if pdf_has_selectable_text(src_pdf):
+        progress_log(str(src_for_output))
+        if _pdf_all_pages_have_text(src_pdf):
             file_text = extract_text_get_text_only(src_pdf)
             write_completed_text(src_for_output, file_text)
         elif app_state.use_vision_for_scanned_pdfs:
-            extract_vision_pdf_incremental(src_pdf, out_md)
-            if src_for_output.suffix.lower() == ".pdf":
-                maybe_write_completed_texts_ocr_clone_pdf(src_for_output)
+            progress_log(f"OCR vía MarkItDown: {src_for_output}")
+            file_text = _convert_with_markitdown(src_pdf)
+            if file_text.strip():
+                write_completed_text(src_for_output, file_text)
+                if src_for_output.suffix.lower() == ".pdf":
+                    maybe_write_completed_texts_ocr_clone_pdf(src_for_output)
+            else:
+                progress_log(f"Sin contenido extraíble vía OCR: {src_for_output}")
         else:
-            print(
-                "Sin texto extraíble (get_text vacío); visión desactivada — "
-                f"omitido: {src_for_output}"
+            file_text = extract_text_get_text_only(src_pdf)
+            non_header = any(
+                line.strip() and not line.startswith("## Página")
+                for line in file_text.split("\n")
             )
+            if non_header:
+                write_completed_text(src_for_output, file_text)
+            else:
+                progress_log(
+                    "Sin texto extraíble; visión desactivada — "
+                    f"omitido: {src_for_output}"
+                )
     except Exception as ex:
-        print(f"Error processing {src_for_output}: {ex}")
+        progress_log(f"Error processing {src_for_output}: {ex}")
 
 
 def _extract_single_source(src: Path) -> None:
@@ -207,31 +154,31 @@ def _extract_single_source(src: Path) -> None:
     if suffix == ".pdf":
         _extract_single_pdf_for_source(src, src)
         return
-    if suffix == ".docx":
+    if suffix in _MARKITDOWN_EXTENSIONS:
         try:
-            text = extract_docx_text(src)
+            text = _convert_with_markitdown(src)
             if text.strip():
                 write_completed_text(src, text)
                 return
-            print(f"Omitido {src}: DOCX sin contenido de texto extraíble.")
+            progress_log(f"Omitido {src}: sin contenido de texto extraíble.")
             return
         except Exception as ex:
-            print(f"Omitido {src}: error extrayendo DOCX ({ex})")
+            progress_log(f"Omitido {src}: error extrayendo con MarkItDown ({ex})")
             return
     if suffix == ".doc":
-        print(
-            f"Omitido {src}: formato .doc no soportado en modo solo-Python. "
-            "Convierta el archivo a .docx."
+        progress_log(
+            f"Omitido {src}: formato .doc no soportado. "
+            "Convierta el archivo a .docx o .pdf."
         )
         return
 
 
-def run_document_extraction() -> None:
-    """Idempotent para documentos soportados (.pdf/.docx/.doc)."""
+def collect_pending_sources() -> list[Path]:
+    """Devuelve documentos soportados pendientes de extracción."""
     assert app_state.files_directory is not None
     check_stop_requested()
     pending: list[Path] = []
-    supported = {".pdf", ".docx", ".doc"}
+    supported = SUPPORTED_EXTENSIONS | {".doc"}
     for root, _, files in os.walk(app_state.files_directory):
         for file in files:
             suffix = Path(file).suffix.lower()
@@ -245,21 +192,34 @@ def run_document_extraction() -> None:
                 out_md
             )
             if nonempty_utf8_file(out_md) and not needs_markers:
-                print(f"Skip extract (already in completed_texts): {src}")
+                progress_log(f"Skip extract (already in completed_texts): {src}")
                 if suffix == ".pdf":
                     maybe_write_completed_texts_ocr_clone_pdf(src)
                 continue
             if needs_markers:
-                print(f"Re-extracción (marcadores de página): {src}")
+                progress_log(f"Re-extracción (marcadores de página): {src}")
             pending.append(src)
+    return pending
+
+
+def run_document_extraction(*, pending_sources: list[Path] | None = None) -> None:
+    """Idempotent para todos los formatos soportados."""
+    pending = (
+        pending_sources if pending_sources is not None else collect_pending_sources()
+    )
     if not pending:
         return
+    progress = get_global_progress()
+    if progress is not None:
+        progress.set_stage("Extracción")
     workers = min(MAX_PARALLEL_PDFS, len(pending))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(_extract_single_source, p) for p in pending]
         for fut in as_completed(futures):
             check_stop_requested()
             fut.result()
+            if progress is not None:
+                progress.advance(1)
 
 
 def run_pdf_extraction() -> None:

@@ -12,6 +12,7 @@ from summarizer import state as app_state
 from summarizer.checkpoints import summary_partials_dir_for_completed_rel
 from summarizer.cornell_summary import summarize_document_paged_windows
 from summarizer.markdown_utils import pdf_has_selectable_text
+from summarizer.progress import progress_log
 from summarizer.stop import check_stop_requested
 from summarizer.pdf_markdown import (
     ensure_markdown_h1_for_pdf,
@@ -124,12 +125,12 @@ def _cleanup_success_artifacts(rel: Path) -> None:
             if candidate.exists():
                 candidate.unlink()
         except OSError as ex:
-            print(f"Aviso limpieza (archivo): {candidate} -> {ex}")
+            progress_log(f"Aviso limpieza (archivo): {candidate} -> {ex}")
     try:
         if partials_dir.exists():
             shutil.rmtree(partials_dir, ignore_errors=False)
     except OSError as ex:
-        print(f"Aviso limpieza (parciales): {partials_dir} -> {ex}")
+        progress_log(f"Aviso limpieza (parciales): {partials_dir} -> {ex}")
 
 
 def summarize_single_completed_md(md_path: Path) -> None:
@@ -140,19 +141,19 @@ def summarize_single_completed_md(md_path: Path) -> None:
         out_summary_pdf = summary_pdfs_output_dir() / rel.with_suffix(".pdf")
 
         if nonempty_utf8_file(out_summary_md) and nonempty_pdf_file(out_summary_pdf):
-            print(f"Skip summarize (summary + PDF done): {rel}")
+            progress_log(f"Skip summarize (summary + PDF done): {rel}")
             return
 
         if nonempty_utf8_file(out_summary_md) and not nonempty_pdf_file(
             out_summary_pdf
         ):
-            print(f"Resume PDF from summary: {rel}")
+            progress_log(f"Resume PDF from summary: {rel}")
             write_summary_pdf(rel, out_summary_md.read_text(encoding="utf-8"))
             if nonempty_pdf_file(out_summary_pdf):
                 _cleanup_success_artifacts(rel)
             return
 
-        print(f"Summarizing: {md_path}")
+        progress_log(f"Summarizing: {md_path}")
         full_text = md_path.read_text(encoding="utf-8")
         if not full_text.strip():
             return
@@ -166,4 +167,4 @@ def summarize_single_completed_md(md_path: Path) -> None:
             if nonempty_pdf_file(out_summary_pdf):
                 _cleanup_success_artifacts(rel)
     except Exception as ex:
-        print(f"Error summarizing {md_path}: {ex}")
+        progress_log(f"Error summarizing {md_path}: {ex}")

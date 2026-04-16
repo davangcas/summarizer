@@ -15,6 +15,7 @@ from summarizer.config import (
     REQUEST_RETRY_BACKOFF_SECONDS,
     REQUEST_TIMEOUT_SECONDS,
 )
+from summarizer.progress import progress_log
 from summarizer.stop import check_stop_requested, sleep_with_stop
 
 TModel = TypeVar("TModel", bound=BaseModel)
@@ -64,7 +65,7 @@ def chat_parse_with_retry(**kwargs: Any) -> ParsedChatCompletion[Any]:
             if attempt >= REQUEST_RETRIES:
                 break
             wait_seconds = REQUEST_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
-            print(
+            progress_log(
                 "LM request timeout/conexión; "
                 f"reintento {attempt}/{REQUEST_RETRIES - 1} en {wait_seconds:.1f}s..."
             )

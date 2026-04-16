@@ -27,13 +27,42 @@ def source_file_is_in_scope(source_path: pathlib.Path) -> bool:
     return source_path.resolve() in source_file_paths
 
 
+_SOURCE_SUFFIXES = (
+    ".pdf",
+    ".docx",
+    ".doc",
+    ".pptx",
+    ".xlsx",
+    ".xls",
+    ".html",
+    ".htm",
+    ".csv",
+    ".json",
+    ".xml",
+    ".epub",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".tiff",
+    ".tif",
+    ".webp",
+    ".mp3",
+    ".wav",
+    ".zip",
+    ".msg",
+    ".rst",
+)
+
+
 def completed_rel_matches_source_filter(rel: pathlib.Path) -> bool:
     """True si el .md bajo completed_texts corresponde a un archivo fuente seleccionado."""
     assert files_directory is not None
     if source_file_paths is None:
         return True
     source_base = (files_directory / rel).with_suffix("")
-    for suffix in (".pdf", ".docx", ".doc"):
+    for suffix in _SOURCE_SUFFIXES:
         if source_base.with_suffix(suffix).resolve() in source_file_paths:
             return True
     return False

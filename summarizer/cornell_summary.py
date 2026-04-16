@@ -22,6 +22,7 @@ from summarizer.config import (
     MAX_PARALLEL_CHUNKS,
     SUMMARY_PAGE_OVERLAP,
     SUMMARY_MAX_PAGES_PER_WINDOW,
+    SUMMARY_UNIFY_WINDOWS,
 )
 from summarizer.fs import atomic_write_text
 from summarizer.llm import (
@@ -31,11 +32,13 @@ from summarizer.llm import (
 )
 from summarizer.markdown_utils import slugify_anchor, split_markdown_by_page_headers
 from summarizer.models import CornellSummaryStructured, CornellTopicBlock
+from summarizer.progress import progress_log
 from summarizer.prompts import (
     BOOK_CHAPTER_OUTLINE_PREFIX,
     SUMMARY_CHUNK_WRAPPER,
     SUMMARY_CORNELL_USER_PREFIX,
     SUMMARY_WINDOW_WRAPPER,
+    UNIFY_ASSEMBLED_CORNELL_PROMPT,
     UNIFY_SUMMARIES_PROMPT,
 )
 from summarizer.stop import check_stop_requested
@@ -218,13 +221,13 @@ def summarize_document_paged_windows(
 
     chapter_outline = chapter_outline_for_summary(full_text)
     if chapter_outline:
-        print(
+        progress_log(
             f"Referencia de capítulos ({len(chapter_outline)} entradas): "
             "entorno o índice detectado en el texto."
         )
 
     max_pages_per_window = max(1, SUMMARY_MAX_PAGES_PER_WINDOW)
-    print(
+    progress_log(
         f"Resumen por ventanas: {len(pages)} páginas detectadas; "
         f"máximo {max_pages_per_window} páginas/ventana; solape {SUMMARY_PAGE_OVERLAP} páginas."
     )
@@ -275,7 +278,7 @@ def summarize_document_paged_windows(
                 raise
             app_state.record_prompt_ratio_overflow()
             if page_count > 1:
-                print(
+                progress_log(
                     f"Overflow en páginas {sp}-{ep}; reintentando con menor granularidad."
                 )
                 parsed = split_markdown_by_page_headers(body)
@@ -301,7 +304,9 @@ def summarize_document_paged_windows(
             chunked = _chunk_single_page_if_needed(pnum, ptext)
             if len(chunked) <= 1:
                 raise
-            print(f"Overflow en página {pnum}; reintentando por fragmentos internos.")
+            progress_log(
+                f"Overflow en página {pnum}; reintentando por fragmentos internos."
+            )
             merged_topics: list[CornellTopicBlock] = []
             for csp, cep, cbody in chunked:
                 _, _, partial = summarize_with_fallback(csp, cep, cbody)
@@ -346,8 +351,38 @@ def summarize_document_paged_windows(
     md = assemble_cornell_windows_markdown(ordered_struct, h1_title=h1_title)
     if combined_md_path is not None and md.strip():
         atomic_write_text(combined_md_path, md)
+
+    if md.strip() and len(ordered_struct) > 1 and SUMMARY_UNIFY_WINDOWS:
+        md = _try_unify_assembled(md, h1_title=h1_title)
+
     if md.strip():
         app_state.record_prompt_ratio_success()
+    return md
+
+
+def _try_unify_assembled(md: str, *, h1_title: str = "Resumen") -> str:
+    """Pasa el ensamblaje de ventanas por el LLM para fusionar duplicados semánticos y mejorar coherencia."""
+    try:
+        unify_prompt = UNIFY_ASSEMBLED_CORNELL_PROMPT.format(combined=md)
+        ratio = app_state.get_adaptive_prompt_ratio()
+        max_budget = max(512, int(app_state.MAX_CONTEXT_TOKENS * ratio))
+        prompt_tokens = count_tokens(unify_prompt)
+        if prompt_tokens > max_budget:
+            progress_log(
+                f"Unificación omitida: el resumen ensamblado ({prompt_tokens} tokens) "
+                f"excede el presupuesto de contexto ({max_budget} tokens)."
+            )
+            return md
+        progress_log(
+            "Unificando resumen de ventanas (fusión de duplicados y coherencia)…"
+        )
+        unified = _chat_cornell_structured(unify_prompt)
+        unified_md = format_cornell_structured_with_index(unified, h1_title=h1_title)
+        if unified_md.strip():
+            progress_log("Resumen unificado correctamente.")
+            return unified_md
+    except Exception as ex:
+        progress_log(f"Unificación omitida (se conserva ensamblaje): {ex}")
     return md
 
 
@@ -416,7 +451,7 @@ def summarize_document(full_text: str, *, h1_title: str = "Resumen") -> str:
     prompt_tokens = count_tokens(single_user)
     current_ratio = app_state.get_adaptive_prompt_ratio()
     effective_input_budget = max(512, int(app_state.MAX_CONTEXT_TOKENS * current_ratio))
-    print(
+    progress_log(
         "Presupuesto de prompt (estimado tokenizer local): "
         f"{prompt_tokens} tokens; límite adaptativo: {effective_input_budget} "
         f"({int(current_ratio * 100)}% de contexto)"
@@ -425,7 +460,7 @@ def summarize_document(full_text: str, *, h1_title: str = "Resumen") -> str:
         try:
             result = summarize_cornell_single(full_text, h1_title=h1_title)
             new_ratio = app_state.record_prompt_ratio_success()
-            print(
+            progress_log(
                 f"Resumen OK; elevando ratio adaptativo a {int(new_ratio * 100)}% para próximos documentos."
             )
             return result
@@ -433,7 +468,7 @@ def summarize_document(full_text: str, *, h1_title: str = "Resumen") -> str:
             if not is_context_overflow_error(ex):
                 raise
             new_ratio = app_state.record_prompt_ratio_overflow()
-            print(
+            progress_log(
                 "Overflow de contexto en resumen único; "
                 f"bajando ratio adaptativo a {int(new_ratio * 100)}%."
             )
@@ -447,7 +482,7 @@ def summarize_document(full_text: str, *, h1_title: str = "Resumen") -> str:
                 full_text, max_chunk_content, h1_title=h1_title
             )
             new_ratio = app_state.record_prompt_ratio_success()
-            print(
+            progress_log(
                 f"Resumen chunked OK; elevando ratio adaptativo a {int(new_ratio * 100)}%."
             )
             return result
@@ -458,7 +493,7 @@ def summarize_document(full_text: str, *, h1_title: str = "Resumen") -> str:
             if max_chunk_content <= 512:
                 raise
             max_chunk_content = max(512, max_chunk_content // 2)
-            print(
+            progress_log(
                 "Context overflow detectado; reduciendo tamaño de fragmentos a "
                 f"~{max_chunk_content} tokens y ratio adaptativo a {int(new_ratio * 100)}%..."
             )

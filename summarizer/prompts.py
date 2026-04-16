@@ -37,14 +37,14 @@ Qué hacer:
 ---
 {body}"""
 
-SUMMARY_WINDOW_WRAPPER = """Contexto: el bloque siguiente contiene el texto de las páginas {start}–{end} del PDF original, separadas por marcadores `## Página N`. Eso es solo delimitación de contexto (no repitas ni uses esos rangos o números de página en los campos `title` del JSON).
+SUMMARY_WINDOW_WRAPPER = """Contexto: el bloque siguiente contiene el texto de las secciones {start}–{end} del documento fuente, separadas por marcadores `## Página N`. Esos marcadores son solo delimitación de contexto (no repitas ni uses esos rangos o números en los campos `title` del JSON).
 
 Qué hacer:
-- Extrae `topics` siguiendo títulos, subtítulos, secciones y temáticas del propio contenido (no una lista por página).
-- Si la misma sección continúa en varias páginas dentro de este bloque, unifica en un solo `topic` con un único `title` y acumula el detalle en `notes` (un solo bloque de notas rico, no varias versiones sucesivas telegráficas).
-- En cada tema, desarrolla `notes` con el mismo nivel de detalle que exigirías en apuntes para un examen: definiciones, fórmulas, pasos y matices presentes en estas páginas (sin inventar).
+- Extrae `topics` siguiendo títulos, subtítulos, secciones y temáticas del propio contenido (no una lista por sección).
+- Si la misma sección continúa en varios bloques dentro de este fragmento, unifica en un solo `topic` con un único `title` y acumula el detalle en `notes` (un solo bloque de notas rico, no varias versiones sucesivas telegráficas).
+- En cada tema, desarrolla `notes` con el mismo nivel de detalle que exigirías en apuntes para un examen: definiciones, fórmulas, pasos y matices presentes en estas secciones (sin inventar).
 - Si el texto está en otro idioma, sintetiza en español salvo nombres propios y términos técnicos habituales.
-- Evita duplicar el mismo tema cerrado solo porque cambia el marcador `## Página`; en solape con otra ventana, prioriza información nueva sin repetir el mismo `title` si el contenido es redundante.
+- Evita duplicar el mismo tema cerrado solo porque cambia el marcador de sección; en solape con otra ventana, prioriza información nueva sin repetir el mismo `title` si el contenido es redundante.
 
 ---
 {body}"""

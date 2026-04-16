@@ -82,6 +82,8 @@ BOOK_OUTLINE_HEURISTIC_ENABLED = env_flag(
 # Si True, en ensamblado se omite un segundo tema con el mismo título normalizado (conserva el primero).
 # Por defecto False: la consolidación post-unify fusiona duplicados sin perder notas entre ventanas.
 ASSEMBLE_DEDUP_GLOBAL = env_flag("SUMMARIZER_ASSEMBLE_DEDUP_GLOBAL", default=False)
+# Paso de unificación LLM tras ensamblar ventanas: fusiona duplicados semánticos y mejora coherencia.
+SUMMARY_UNIFY_WINDOWS = env_flag("SUMMARIZER_SUMMARY_UNIFY_WINDOWS", default=True)
 
 REQUEST_TIMEOUT_SECONDS = env_optional_timeout_seconds(
     "SUMMARIZER_REQUEST_TIMEOUT_SECONDS", None
