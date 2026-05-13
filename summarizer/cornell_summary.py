@@ -425,11 +425,7 @@ def summarize_document_paged_windows(
         atomic_write_text(combined_md_path, assembled_md)
 
     final_md = assembled_md
-    if (
-        assembled_md.strip()
-        and len(ordered_struct) > 1
-        and SUMMARY_UNIFY_WINDOWS
-    ):
+    if assembled_md.strip() and len(ordered_struct) > 1 and SUMMARY_UNIFY_WINDOWS:
         final_md = _try_unify_assembled(assembled_md, h1_title=h1_title)
 
     if final_md.strip():
@@ -501,9 +497,7 @@ def _hierarchical_unify_markdown(
         )
         pt = count_tokens(prompt)
         if pt > max_budget:
-            pieces = chunk_text_by_tokens(
-                combined, max(max_batch_content // 2, 2048)
-            )
+            pieces = chunk_text_by_tokens(combined, max(max_batch_content // 2, 2048))
             for pj, piece in enumerate(pieces, start=1):
                 sub_prompt = UNIFY_ASSEMBLED_CORNELL_BATCH_PROMPT.format(
                     part=pj, total=len(pieces), combined=piece

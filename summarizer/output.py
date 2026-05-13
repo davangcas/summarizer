@@ -153,9 +153,7 @@ def summarize_single_completed_md(md_path: Path) -> None:
             progress_log(f"Resume PDF from summary: {rel}")
             write_summary_pdf(rel, out_summary_md.read_text(encoding="utf-8"))
             if nonempty_pdf_file(out_summary_pdf):
-                _cleanup_success_artifacts(
-                    rel, keep_partials=SUMMARY_KEEP_PARTIALS
-                )
+                _cleanup_success_artifacts(rel, keep_partials=SUMMARY_KEEP_PARTIALS)
             return
 
         progress_log(f"Summarizing: {md_path}")
@@ -181,8 +179,6 @@ def summarize_single_completed_md(md_path: Path) -> None:
                         f"(Markdown y PDF junto al resumen principal)."
                     )
             if nonempty_pdf_file(out_summary_pdf):
-                _cleanup_success_artifacts(
-                    rel, keep_partials=SUMMARY_KEEP_PARTIALS
-                )
+                _cleanup_success_artifacts(rel, keep_partials=SUMMARY_KEEP_PARTIALS)
     except Exception as ex:
         progress_log(f"Error summarizing {md_path}: {ex}")
