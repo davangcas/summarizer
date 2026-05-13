@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -20,9 +21,12 @@ from summarizer.config import (
     ASSEMBLE_DEDUP_BORDER,
     ASSEMBLE_DEDUP_GLOBAL,
     MAX_PARALLEL_CHUNKS,
+    MAX_PARALLEL_WINDOW_SUMMARIES,
     SUMMARY_PAGE_OVERLAP,
     SUMMARY_MAX_PAGES_PER_WINDOW,
+    SUMMARY_UNIFY_HIERARCHICAL,
     SUMMARY_UNIFY_WINDOWS,
+    cornell_depth_profile,
 )
 from summarizer.fs import atomic_write_text
 from summarizer.llm import (
@@ -35,14 +39,67 @@ from summarizer.models import CornellSummaryStructured, CornellTopicBlock
 from summarizer.progress import progress_log
 from summarizer.prompts import (
     BOOK_CHAPTER_OUTLINE_PREFIX,
+    CORNELL_DEPTH_HIGH_SUFFIX,
     SUMMARY_CHUNK_WRAPPER,
     SUMMARY_CORNELL_USER_PREFIX,
     SUMMARY_WINDOW_WRAPPER,
+    UNIFY_ASSEMBLED_CORNELL_BATCH_PROMPT,
     UNIFY_ASSEMBLED_CORNELL_PROMPT,
     UNIFY_SUMMARIES_PROMPT,
 )
 from summarizer.stop import check_stop_requested
 from summarizer.tokenizer import chunk_text_by_tokens, count_tokens
+
+_MAX_UNIFY_DEPTH = 12
+_UNIFY_BATCH_OVERHEAD_TOKENS = 900
+
+
+def _effective_cornell_user_prefix() -> str:
+    if cornell_depth_profile() == "high":
+        return f"{SUMMARY_CORNELL_USER_PREFIX}\n\n{CORNELL_DEPTH_HIGH_SUFFIX}"
+    return SUMMARY_CORNELL_USER_PREFIX
+
+
+def _topic_sections_from_assembled_markdown(md: str) -> list[str]:
+    """Extrae bloques `### ...` del cuerpo tras el primer `---` (formato ensamblado)."""
+    md = md.strip()
+    sep = "\n---\n\n"
+    if sep in md:
+        body = md.split(sep, 1)[1].strip()
+    else:
+        body = md
+    if not body:
+        return []
+    parts = re.split(r"(?=\n\n### )", body)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _group_topic_sections_into_batches(
+    sections: list[str], *, max_batch_content_tokens: int
+) -> list[list[str]]:
+    """Agrupa secciones en lotes que caben en el presupuesto de tokens del prompt de unificación."""
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_tokens = 0
+    for s in sections:
+        t = count_tokens(s)
+        if t > max_batch_content_tokens:
+            if current:
+                batches.append(current)
+                current = []
+                current_tokens = 0
+            for piece in chunk_text_by_tokens(s, max_batch_content_tokens):
+                batches.append([piece])
+            continue
+        if current and current_tokens + t > max_batch_content_tokens:
+            batches.append(current)
+            current = []
+            current_tokens = 0
+        current.append(s)
+        current_tokens += t
+    if current:
+        batches.append(current)
+    return batches
 
 
 def _format_cornell_topic_markdown(t: CornellTopicBlock, *, slug: str) -> str:
@@ -103,7 +160,7 @@ def _chunk_single_page_if_needed(
     pnum: int, ptext: str, *, safety_margin: int = 200
 ) -> list[tuple[int, int, str]]:
     base_wrapper = SUMMARY_WINDOW_WRAPPER.format(start=pnum, end=pnum, body="")
-    base_tokens = count_tokens(f"{SUMMARY_CORNELL_USER_PREFIX}\n\n{base_wrapper}")
+    base_tokens = count_tokens(f"{_effective_cornell_user_prefix()}\n\n{base_wrapper}")
     ratio = app_state.get_adaptive_prompt_ratio()
     max_prompt = max(512, int(app_state.MAX_CONTEXT_TOKENS * ratio))
     room = max(256, max_prompt - base_tokens - safety_margin)
@@ -195,7 +252,7 @@ def _chat_cornell_window(
     chapter_outline: list[str] | None = None,
 ) -> CornellSummaryStructured:
     wrapped = SUMMARY_WINDOW_WRAPPER.format(start=start_p, end=end_p, body=body)
-    user_content = f"{SUMMARY_CORNELL_USER_PREFIX}\n\n{wrapped}"
+    user_content = f"{_effective_cornell_user_prefix()}\n\n{wrapped}"
     if chapter_outline:
         outline_lines = "\n".join(f"- {c}" for c in chapter_outline)
         user_content += BOOK_CHAPTER_OUTLINE_PREFIX.format(outline_lines=outline_lines)
@@ -212,11 +269,11 @@ def summarize_document_paged_windows(
     *,
     partials_dir: Path | None = None,
     h1_title: str = "Resumen",
-) -> str:
-    """Resumen Cornell por ventanas de páginas (máximo fijo por ventana, con fallback 2/1)."""
+) -> tuple[str, str]:
+    """Resumen Cornell por ventanas. Devuelve (markdown_final, markdown_ensamblado_pre_unificación)."""
     pages = split_markdown_by_page_headers(full_text)
     if not pages:
-        return ""
+        return "", ""
     check_stop_requested()
 
     chapter_outline = chapter_outline_for_summary(full_text)
@@ -240,7 +297,7 @@ def summarize_document_paged_windows(
         max_pages_per_window=max_pages_per_window,
     )
     if not windows:
-        return ""
+        return "", ""
 
     use_partials = partials_dir is not None and summary_partials_enabled()
     if use_partials:
@@ -337,50 +394,178 @@ def summarize_document_paged_windows(
         return task_i, (sp, ep, structured)
 
     results: dict[int, tuple[int, int, CornellSummaryStructured]] = {}
-    for i, w in enumerate(windows):
-        check_stop_requested()
-        idx, triple = run_window(i, w)
-        results[idx] = triple
+    n_win = len(windows)
+    workers = min(MAX_PARALLEL_WINDOW_SUMMARIES, max(1, n_win))
+    if workers <= 1 or n_win == 1:
+        for i, w in enumerate(windows):
+            check_stop_requested()
+            idx, triple = run_window(i, w)
+            results[idx] = triple
+    else:
+        progress_log(
+            f"Resumen de ventanas en paralelo ({workers} workers, {n_win} ventanas)."
+        )
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_map = {
+                pool.submit(run_window, i, w): i for i, w in enumerate(windows)
+            }
+            for fut in as_completed(future_map):
+                check_stop_requested()
+                task_i, triple = fut.result()
+                results[task_i] = triple
 
-    ordered_struct = [results[i] for i in range(len(windows))]
+    ordered_struct = [results[i] for i in range(n_win)]
     combined_md_path = (
         (partials_dir / "_combined_windows.md")
         if use_partials and partials_dir
         else None
     )
-    md = assemble_cornell_windows_markdown(ordered_struct, h1_title=h1_title)
-    if combined_md_path is not None and md.strip():
-        atomic_write_text(combined_md_path, md)
+    assembled_md = assemble_cornell_windows_markdown(ordered_struct, h1_title=h1_title)
+    if combined_md_path is not None and assembled_md.strip():
+        atomic_write_text(combined_md_path, assembled_md)
 
-    if md.strip() and len(ordered_struct) > 1 and SUMMARY_UNIFY_WINDOWS:
-        md = _try_unify_assembled(md, h1_title=h1_title)
+    final_md = assembled_md
+    if (
+        assembled_md.strip()
+        and len(ordered_struct) > 1
+        and SUMMARY_UNIFY_WINDOWS
+    ):
+        final_md = _try_unify_assembled(assembled_md, h1_title=h1_title)
 
-    if md.strip():
+    if final_md.strip():
         app_state.record_prompt_ratio_success()
-    return md
+    return final_md, assembled_md
+
+
+def _single_pass_unify_if_fits(
+    md: str, *, h1_title: str, max_budget: int
+) -> str | None:
+    """Devuelve Markdown unificado si el prompt cabe en el presupuesto; si no, None."""
+    unify_prompt = UNIFY_ASSEMBLED_CORNELL_PROMPT.format(combined=md)
+    prompt_tokens = count_tokens(unify_prompt)
+    if prompt_tokens > max_budget:
+        return None
+    progress_log(
+        "Unificando resumen de ventanas (fusión de duplicados y coherencia, un solo paso)…"
+    )
+    unified = _chat_cornell_structured(unify_prompt)
+    unified_md = format_cornell_structured_with_index(unified, h1_title=h1_title)
+    if unified_md.strip():
+        progress_log("Resumen unificado correctamente.")
+        return unified_md
+    return None
+
+
+def _hierarchical_unify_markdown(
+    md: str, *, h1_title: str, max_budget: int, depth: int = 0
+) -> str:
+    """Reduce por lotes cuando el ensamblaje no cabe en un único prompt de unificación."""
+    if depth > _MAX_UNIFY_DEPTH:
+        progress_log(
+            "Unificación jerárquica: profundidad máxima alcanzada; se conserva el último ensamblaje."
+        )
+        return md
+
+    single = _single_pass_unify_if_fits(md, h1_title=h1_title, max_budget=max_budget)
+    if single is not None:
+        return single
+
+    sections = _topic_sections_from_assembled_markdown(md)
+    if not sections:
+        progress_log(
+            "Unificación jerárquica: no se detectaron bloques ###; se conserva ensamblaje."
+        )
+        return md
+
+    batch_empty = UNIFY_ASSEMBLED_CORNELL_BATCH_PROMPT.format(
+        part=1, total=1, combined=""
+    )
+    overhead = count_tokens(batch_empty) + _UNIFY_BATCH_OVERHEAD_TOKENS
+    max_batch_content = max(4096, max_budget - overhead)
+
+    batches = _group_topic_sections_into_batches(
+        sections, max_batch_content_tokens=max_batch_content
+    )
+    progress_log(
+        f"Unificación jerárquica: {len(sections)} bloques → {len(batches)} lote(s) "
+        f"(nivel {depth + 1})."
+    )
+
+    merged_topics: list[CornellTopicBlock] = []
+    total_batches = len(batches)
+    for bi, batch in enumerate(batches, start=1):
+        check_stop_requested()
+        combined = "\n\n".join(batch)
+        prompt = UNIFY_ASSEMBLED_CORNELL_BATCH_PROMPT.format(
+            part=bi, total=total_batches, combined=combined
+        )
+        pt = count_tokens(prompt)
+        if pt > max_budget:
+            pieces = chunk_text_by_tokens(
+                combined, max(max_batch_content // 2, 2048)
+            )
+            for pj, piece in enumerate(pieces, start=1):
+                sub_prompt = UNIFY_ASSEMBLED_CORNELL_BATCH_PROMPT.format(
+                    part=pj, total=len(pieces), combined=piece
+                )
+                part_struct = _chat_cornell_structured(sub_prompt)
+                merged_topics.extend(part_struct.topics)
+        else:
+            part_struct = _chat_cornell_structured(prompt)
+            merged_topics.extend(part_struct.topics)
+
+    if not merged_topics:
+        return md
+
+    next_md = format_cornell_structured_with_index(
+        CornellSummaryStructured(topics=merged_topics), h1_title=h1_title
+    )
+
+    if len(merged_topics) >= len(sections) and depth >= 3:
+        progress_log(
+            "Unificación jerárquica: se detiene tras fusiones limitadas; "
+            "resultado del último lote."
+        )
+        final_try = _single_pass_unify_if_fits(
+            next_md, h1_title=h1_title, max_budget=max_budget
+        )
+        return final_try if final_try is not None else next_md
+
+    unified_full = UNIFY_ASSEMBLED_CORNELL_PROMPT.format(combined=next_md)
+    if count_tokens(unified_full) <= max_budget:
+        final_try = _single_pass_unify_if_fits(
+            next_md, h1_title=h1_title, max_budget=max_budget
+        )
+        return final_try if final_try is not None else next_md
+
+    return _hierarchical_unify_markdown(
+        next_md, h1_title=h1_title, max_budget=max_budget, depth=depth + 1
+    )
 
 
 def _try_unify_assembled(md: str, *, h1_title: str = "Resumen") -> str:
-    """Pasa el ensamblaje de ventanas por el LLM para fusionar duplicados semánticos y mejorar coherencia."""
+    """Fusiona duplicados y coherencia (un paso y/o por lotes según tamaño y flags)."""
     try:
-        unify_prompt = UNIFY_ASSEMBLED_CORNELL_PROMPT.format(combined=md)
         ratio = app_state.get_adaptive_prompt_ratio()
         max_budget = max(512, int(app_state.MAX_CONTEXT_TOKENS * ratio))
-        prompt_tokens = count_tokens(unify_prompt)
-        if prompt_tokens > max_budget:
-            progress_log(
-                f"Unificación omitida: el resumen ensamblado ({prompt_tokens} tokens) "
-                f"excede el presupuesto de contexto ({max_budget} tokens)."
+        if SUMMARY_UNIFY_HIERARCHICAL:
+            return _hierarchical_unify_markdown(
+                md, h1_title=h1_title, max_budget=max_budget, depth=0
             )
-            return md
-        progress_log(
-            "Unificando resumen de ventanas (fusión de duplicados y coherencia)…"
+        single = _single_pass_unify_if_fits(
+            md, h1_title=h1_title, max_budget=max_budget
         )
-        unified = _chat_cornell_structured(unify_prompt)
-        unified_md = format_cornell_structured_with_index(unified, h1_title=h1_title)
-        if unified_md.strip():
-            progress_log("Resumen unificado correctamente.")
-            return unified_md
+        if single is not None:
+            return single
+        unify_prompt = UNIFY_ASSEMBLED_CORNELL_PROMPT.format(combined=md)
+        progress_log(
+            "Unificación omitida: el resumen ensamblado ("
+            f"{count_tokens(unify_prompt)} tokens) excede el presupuesto "
+            f"({max_budget} tokens). Puede activar la unificación jerárquica "
+            "(SUMMARIZER_SUMMARY_UNIFY_HIERARCHICAL, por defecto activa) o "
+            "desactivar la unificación (SUMMARIZER_SUMMARY_UNIFY_WINDOWS=false)."
+        )
+        return md
     except Exception as ex:
         progress_log(f"Unificación omitida (se conserva ensamblaje): {ex}")
     return md
@@ -396,7 +581,7 @@ def _chat_cornell_structured(user_content: str) -> CornellSummaryStructured:
 
 
 def summarize_cornell_single(full_text: str, *, h1_title: str = "Resumen") -> str:
-    user_content = f"{SUMMARY_CORNELL_USER_PREFIX}\n\n---\n\n{full_text}"
+    user_content = f"{_effective_cornell_user_prefix()}\n\n---\n\n{full_text}"
     return format_cornell_markdown(
         _chat_cornell_structured(user_content), h1_title=h1_title
     )
@@ -404,7 +589,7 @@ def summarize_cornell_single(full_text: str, *, h1_title: str = "Resumen") -> st
 
 def _summarize_one_chunk(part: int, total: int, body: str) -> tuple[int, str]:
     wrapped = SUMMARY_CHUNK_WRAPPER.format(part=part, total=total, body=body)
-    user_content = f"{SUMMARY_CORNELL_USER_PREFIX}\n\n{wrapped}"
+    user_content = f"{_effective_cornell_user_prefix()}\n\n{wrapped}"
     md = format_cornell_markdown(
         _chat_cornell_structured(user_content), document_title=False
     )
@@ -447,7 +632,7 @@ def summarize_cornell_chunked(
 
 def summarize_document(full_text: str, *, h1_title: str = "Resumen") -> str:
     check_stop_requested()
-    single_user = f"{SUMMARY_CORNELL_USER_PREFIX}\n\n---\n\n{full_text}"
+    single_user = f"{_effective_cornell_user_prefix()}\n\n---\n\n{full_text}"
     prompt_tokens = count_tokens(single_user)
     current_ratio = app_state.get_adaptive_prompt_ratio()
     effective_input_budget = max(512, int(app_state.MAX_CONTEXT_TOKENS * current_ratio))

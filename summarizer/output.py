@@ -10,6 +10,7 @@ from markdown_pdf import MarkdownPdf, Section
 from summarizer import paths
 from summarizer import state as app_state
 from summarizer.checkpoints import summary_partials_dir_for_completed_rel
+from summarizer.config import SUMMARY_DUAL_OUTPUT, SUMMARY_KEEP_PARTIALS
 from summarizer.cornell_summary import summarize_document_paged_windows
 from summarizer.markdown_utils import pdf_has_selectable_text
 from summarizer.progress import progress_log
@@ -116,7 +117,7 @@ def write_summary_pdf(md_source_rel: Path, summary_md: str) -> None:
     render_markdown_to_pdf(out_pdf, summary_md, fallback_h1=md_source_rel.stem)
 
 
-def _cleanup_success_artifacts(rel: Path) -> None:
+def _cleanup_success_artifacts(rel: Path, *, keep_partials: bool = False) -> None:
     completed_md = paths.completed_texts / rel
     summary_md = paths.summarized_texts / rel
     partials_dir = summary_partials_dir_for_completed_rel(rel)
@@ -126,6 +127,8 @@ def _cleanup_success_artifacts(rel: Path) -> None:
                 candidate.unlink()
         except OSError as ex:
             progress_log(f"Aviso limpieza (archivo): {candidate} -> {ex}")
+    if keep_partials:
+        return
     try:
         if partials_dir.exists():
             shutil.rmtree(partials_dir, ignore_errors=False)
@@ -150,7 +153,9 @@ def summarize_single_completed_md(md_path: Path) -> None:
             progress_log(f"Resume PDF from summary: {rel}")
             write_summary_pdf(rel, out_summary_md.read_text(encoding="utf-8"))
             if nonempty_pdf_file(out_summary_pdf):
-                _cleanup_success_artifacts(rel)
+                _cleanup_success_artifacts(
+                    rel, keep_partials=SUMMARY_KEEP_PARTIALS
+                )
             return
 
         progress_log(f"Summarizing: {md_path}")
@@ -158,13 +163,26 @@ def summarize_single_completed_md(md_path: Path) -> None:
         if not full_text.strip():
             return
         partials = summary_partials_dir_for_completed_rel(rel)
-        summary_md = summarize_document_paged_windows(
+        summary_md, assembled_md = summarize_document_paged_windows(
             full_text, partials_dir=partials, h1_title=rel.stem
         )
         if summary_md.strip():
             write_summary_markdown(rel, summary_md)
             write_summary_pdf(rel, summary_md)
+            if SUMMARY_DUAL_OUTPUT and assembled_md.strip():
+                asm = assembled_md.strip()
+                fin = summary_md.strip()
+                if asm != fin:
+                    full_rel = rel.with_name(f"{rel.stem}_full{rel.suffix}")
+                    write_summary_markdown(full_rel, assembled_md)
+                    write_summary_pdf(full_rel, assembled_md)
+                    progress_log(
+                        f"Copia ensamblaje pre-unificación: {full_rel.name} "
+                        f"(Markdown y PDF junto al resumen principal)."
+                    )
             if nonempty_pdf_file(out_summary_pdf):
-                _cleanup_success_artifacts(rel)
+                _cleanup_success_artifacts(
+                    rel, keep_partials=SUMMARY_KEEP_PARTIALS
+                )
     except Exception as ex:
         progress_log(f"Error summarizing {md_path}: {ex}")

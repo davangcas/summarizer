@@ -84,6 +84,21 @@ BOOK_OUTLINE_HEURISTIC_ENABLED = env_flag(
 ASSEMBLE_DEDUP_GLOBAL = env_flag("SUMMARIZER_ASSEMBLE_DEDUP_GLOBAL", default=False)
 # Paso de unificación LLM tras ensamblar ventanas: fusiona duplicados semánticos y mejora coherencia.
 SUMMARY_UNIFY_WINDOWS = env_flag("SUMMARIZER_SUMMARY_UNIFY_WINDOWS", default=True)
+# Si True y la unificación está activa, usar troceo por lotes + reducción en niveles cuando el ensamblaje
+# no cabe en un solo prompt (evita colapsar libros largos a un único JSON pequeño).
+SUMMARY_UNIFY_HIERARCHICAL = env_flag("SUMMARIZER_SUMMARY_UNIFY_HIERARCHICAL", default=True)
+# Escribe además `stem_full.md` / `stem_full.pdf` con el ensamblaje de ventanas antes de unificar.
+SUMMARY_DUAL_OUTPUT = env_flag("SUMMARIZER_SUMMARY_DUAL_OUTPUT", default=False)
+# No borrar `summary_partials/` tras éxito (checkpoints y `_combined_windows.md`).
+SUMMARY_KEEP_PARTIALS = env_flag("SUMMARIZER_SUMMARY_KEEP_PARTIALS", default=False)
+
+
+def cornell_depth_profile() -> str:
+    """normal | high — controla instrucciones extra en prompts Cornell (ver prompts.py)."""
+    raw = os.environ.get("SUMMARIZER_CORNELL_DEPTH", "normal").strip().lower()
+    if raw in ("high", "deep", "alto", "max"):
+        return "high"
+    return "normal"
 
 REQUEST_TIMEOUT_SECONDS = env_optional_timeout_seconds(
     "SUMMARIZER_REQUEST_TIMEOUT_SECONDS", None

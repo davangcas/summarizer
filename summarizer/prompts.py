@@ -26,6 +26,11 @@ Instrucciones:
 7. No crees temas "meta" que solo repitan el título del libro o del documento sin contenido sustantivo (definiciones, hechos o argumentos del texto). Si un bloque no aporta más que una frase genérica, no lo incluyas como topic separado.
 8. Evita duplicar el mismo capítulo o temática con títulos casi idénticos (p. ej. título del libro y "título del libro: origen"); unifica en un solo topic cuando sea el mismo asunto."""
 
+CORNELL_DEPTH_HIGH_SUFFIX = """Instrucciones adicionales (perfil de profundidad alta):
+- Cuando el fragmento tenga varias ideas o secciones claramente distintas, prefiere varios `topics` (uno por subapartado o argumento principal) en lugar de un solo tema monolítico.
+- En `notes`, usa párrafos o viñetas numeradas para subpasos; si hay listas o enumeraciones en el original, refleja esa granularidad.
+- No reduzcas varias definiciones o ejemplos distintos a una sola frase si cada uno aporta matices distintos para el estudio."""
+
 SUMMARY_CHUNK_WRAPPER = """Contexto: este bloque es el fragmento {part} de {total} de un documento largo (no tienes el resto).
 
 Qué hacer:
@@ -69,6 +74,22 @@ Reglas:
 4. Ordena los temas en secuencia lógica coherente con el documento (orden de exposición del autor, no orden aleatorio).
 5. Mantén rigor: no inventes hechos. `notes` debe seguir siendo el campo más detallado de cada tema; `topic_summary` solo cierra en pocas frases.
 6. Salida: solo JSON, en español, sin markdown fuera del JSON.
+
+---
+{combined}
+"""
+
+UNIFY_ASSEMBLED_CORNELL_BATCH_PROMPT = """Rol: editor académico de apuntes estilo Cornell (lote parcial de un documento largo).
+
+Este es el LOTE {part} de {total} de un resumen ya generado en Markdown (bloques `###` con Pistas, Notas y Resumen del tema). Otros lotes existen antes y después; NO inventes contenido que no aparezca aquí.
+
+Objetivo: devuelve UN ÚNICO JSON (esquema `topics`: title, cues, notes, topic_summary) que cubra solo este lote.
+
+Reglas:
+1. Fusiona dentro de este lote los temas que traten exactamente el mismo asunto (títulos casi idénticos o notas redundantes). Al fusionar, concatena y enriquece `notes`: conserva definiciones, fórmulas, pasos y matices; elimina solo repeticiones literales obvias. No acortes `notes` a frases telegráficas si el material del lote aporta más detalle.
+2. No elimines temas distintos solo por ahorrar espacio: si son asuntos diferentes, mantén `topics` separados.
+3. Ordena los temas en el orden de aparición en este lote.
+4. Salida: solo JSON, en español, sin markdown fuera del JSON.
 
 ---
 {combined}
