@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 
 from tqdm import tqdm
@@ -80,9 +81,29 @@ def close_global_progress() -> None:
             _global_progress = None
 
 
+def _safe_print(message: str) -> None:
+    """``print`` resiliente a consolas con encoding limitado (Windows cp1252).
+
+    Caracteres como ``→`` o emojis fallan con ``UnicodeEncodeError`` cuando
+    ``sys.stdout`` usa ``charmap``. En ese caso degradamos a un reemplazo
+    de caracteres no representables para no romper el flujo principal.
+    """
+    try:
+        print(message)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(message.encode(enc, errors="replace").decode(enc, errors="replace"))
+
+
 def progress_log(message: str) -> None:
     progress = get_global_progress()
     if progress is None:
-        print(message)
+        _safe_print(message)
         return
-    progress.log(message)
+    try:
+        progress.log(message)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        progress.log(
+            message.encode(enc, errors="replace").decode(enc, errors="replace")
+        )

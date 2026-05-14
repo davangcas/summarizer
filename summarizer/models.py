@@ -40,9 +40,11 @@ class CornellTopicBlock(BaseModel):
         description=(
             "Cuerpo principal de apuntes académicos (el campo más largo del tema salvo temas triviales de una línea): "
             "varios párrafos o viñetas con definiciones, hipótesis, procedimientos paso a paso, notación, "
-            "fórmulas (texto o LaTeX ligero), relaciones entre ideas, condiciones de aplicación y límites del modelo "
-            "cuando el original los mencione. Parafrasea en lugar de copiar párrafos literales largos, "
-            "pero conserva el detalle técnico útil. "
+            "relaciones entre ideas, condiciones de aplicación y límites del modelo cuando el original los mencione. "
+            "Parafrasea en lugar de copiar párrafos literales largos, pero conserva el detalle técnico útil. "
+            "Fórmulas: usa LaTeX entre $...$ o $$...$$ con los backslashes DUPLICADOS en JSON "
+            "(escribe \\\\frac, \\\\text, \\\\sqrt); si no puedes garantizar el doble escape, prefiere Unicode "
+            "(m/s², ·, π, ≈, ≤, ≥). No metas saltos de línea dentro de un span $...$. "
             "Solo si el fragmento termina antes de cerrar el tema y el origen no lo cierra aquí, indica al final: "
             "(continúa en el siguiente fragmento)."
         )

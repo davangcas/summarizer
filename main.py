@@ -32,7 +32,11 @@ from summarizer.tokenizer import get_tokenizer
 
 
 def sync_ocr_pdfs_to_summary_destination() -> None:
-    """Copia PDFs OCR de texto completo al destino de resúmenes bajo OCR_PDFS."""
+    """Copia PDFs OCR de texto completo al destino de resúmenes bajo OCR_PDFS.
+
+    Idempotente: si el destino ya existe con el mismo tamaño y mtime que la
+    fuente, se omite la copia.
+    """
     src_root = paths.completed_texts_ocr
     if not src_root.is_dir():
         return
@@ -41,6 +45,16 @@ def sync_ocr_pdfs_to_summary_destination() -> None:
         rel = src_pdf.relative_to(src_root)
         dst_pdf = dst_root / rel
         dst_pdf.parent.mkdir(parents=True, exist_ok=True)
+        if dst_pdf.exists():
+            try:
+                src_stat = src_pdf.stat()
+                dst_stat = dst_pdf.stat()
+                if src_stat.st_size == dst_stat.st_size and int(
+                    src_stat.st_mtime
+                ) == int(dst_stat.st_mtime):
+                    continue
+            except OSError:
+                pass
         shutil.copy2(src_pdf, dst_pdf)
 
 

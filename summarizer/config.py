@@ -62,6 +62,11 @@ SUMMARY_RETRY_MAX_PAGES_STEPDOWN = env_int(
 ASSEMBLE_DEDUP_BORDER = os.environ.get(
     "SUMMARIZER_ASSEMBLE_DEDUP_BORDER", ""
 ).strip().lower() in ("1", "true", "yes", "sí", "si", "on")
+# Umbral Jaccard para considerar dos temas como duplicados semánticos
+# (se aplica al máximo entre Jaccard de títulos y Jaccard de firmas completas).
+SEMANTIC_DEDUP_THRESHOLD = float(
+    os.environ.get("SUMMARIZER_SEMANTIC_DEDUP_THRESHOLD", "0.5")
+)
 
 
 def env_flag(name: str, *, default: bool) -> bool:
@@ -74,6 +79,18 @@ def env_flag(name: str, *, default: bool) -> bool:
         return True
     return default
 
+
+# Extracción híbrida: usa OCR sólo en páginas sin texto, no en el documento entero.
+HYBRID_OCR_ENABLED = env_flag("SUMMARIZER_HYBRID_OCR", default=True)
+
+# Pre-renderizado de fórmulas LaTeX a PNG (matplotlib.mathtext) antes de generar PDF.
+MATH_RENDER_ENABLED = env_flag("SUMMARIZER_MATH_RENDER", default=True)
+
+# DPI usado al renderizar fórmulas a PNG con matplotlib.
+MATH_RENDER_DPI = env_int("SUMMARIZER_MATH_DPI", 200)
+
+# Ventana de escaneo del índice (en caracteres) sobre el inicio del texto completado.
+BOOK_OUTLINE_SCAN_CHARS = env_int("SUMMARIZER_BOOK_OUTLINE_SCAN_CHARS", 64000)
 
 # Heurística de índice del libro en las primeras páginas (INDICE + líneas con puntos guía).
 BOOK_OUTLINE_HEURISTIC_ENABLED = env_flag(
@@ -89,6 +106,44 @@ SUMMARY_UNIFY_WINDOWS = env_flag("SUMMARIZER_SUMMARY_UNIFY_WINDOWS", default=Tru
 SUMMARY_UNIFY_HIERARCHICAL = env_flag(
     "SUMMARIZER_SUMMARY_UNIFY_HIERARCHICAL", default=True
 )
+# Tras la unificación jerárquica, ¿correr una pasada FINAL "single-pass" sobre todo el resultado?
+# Esa pasada tiende a comprimir agresivamente (el LLM resume lo que ya estaba consolidado),
+# por eso por defecto está apagada. Actívala si prefieres un texto más sintético a costa de
+# perder detalle entre lotes. Equivale a SUMMARY_UNIFY_MODE=aggressive.
+SUMMARY_FINAL_UNIFY_PASS = env_flag(
+    "SUMMARIZER_SUMMARY_FINAL_UNIFY_PASS", default=False
+)
+
+
+_VALID_UNIFY_MODES = ("none", "lmless", "hierarchical", "aggressive")
+
+
+def _resolve_unify_mode() -> str:
+    """Modo de unificación post-ensamblado:
+
+    - ``none``: devuelve el ensamblaje (Jaccard dedup ya aplicado) sin tocar.
+      Cero llamadas LLM extra. Máximo detalle, conserva duplicados blandos.
+    - ``lmless``: una segunda pasada Jaccard (umbral relajado) sobre el
+      ensamblaje. Cero llamadas LLM extra. Más detalle que ``hierarchical``,
+      menos duplicados blandos que ``none``.
+    - ``hierarchical`` (default): unificación por lotes con LLM, sin pasada
+      final. Es el comportamiento actual heredado.
+    - ``aggressive``: hierarchical + pasada final single-pass LLM. Más
+      síntesis a costa de detalle.
+
+    Si la variable explícita no está seteada y el flag legado
+    ``SUMMARIZER_SUMMARY_FINAL_UNIFY_PASS`` está activo, se mapea a
+    ``aggressive`` (backward-compat).
+    """
+    raw = os.environ.get("SUMMARIZER_SUMMARY_UNIFY_MODE", "").strip().lower()
+    if raw in _VALID_UNIFY_MODES:
+        return raw
+    if SUMMARY_FINAL_UNIFY_PASS:
+        return "aggressive"
+    return "hierarchical"
+
+
+SUMMARY_UNIFY_MODE = _resolve_unify_mode()
 # Escribe además `stem_full.md` / `stem_full.pdf` con el ensamblaje de ventanas antes de unificar.
 SUMMARY_DUAL_OUTPUT = env_flag("SUMMARIZER_SUMMARY_DUAL_OUTPUT", default=False)
 # No borrar `summary_partials/` tras éxito (checkpoints y `_combined_windows.md`).

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -22,16 +23,17 @@ from summarizer.config import (
     ASSEMBLE_DEDUP_GLOBAL,
     MAX_PARALLEL_CHUNKS,
     MAX_PARALLEL_WINDOW_SUMMARIES,
+    SEMANTIC_DEDUP_THRESHOLD,
     SUMMARY_PAGE_OVERLAP,
     SUMMARY_MAX_PAGES_PER_WINDOW,
     SUMMARY_UNIFY_HIERARCHICAL,
+    SUMMARY_UNIFY_MODE,
     SUMMARY_UNIFY_WINDOWS,
     cornell_depth_profile,
 )
 from summarizer.fs import atomic_write_text
 from summarizer.llm import (
-    chat_parse_with_retry,
-    completion_parsed_or_validate,
+    chat_structured_with_retry,
     is_context_overflow_error,
 )
 from summarizer.markdown_utils import slugify_anchor, split_markdown_by_page_headers
@@ -41,7 +43,7 @@ from summarizer.prompts import (
     BOOK_CHAPTER_OUTLINE_PREFIX,
     CORNELL_DEPTH_HIGH_SUFFIX,
     SUMMARY_CHUNK_WRAPPER,
-    SUMMARY_CORNELL_USER_PREFIX,
+    SUMMARY_CORNELL_SYSTEM_PROMPT,
     SUMMARY_WINDOW_WRAPPER,
     UNIFY_ASSEMBLED_CORNELL_BATCH_PROMPT,
     UNIFY_ASSEMBLED_CORNELL_PROMPT,
@@ -54,10 +56,39 @@ _MAX_UNIFY_DEPTH = 12
 _UNIFY_BATCH_OVERHEAD_TOKENS = 900
 
 
-def _effective_cornell_user_prefix() -> str:
+def _write_partial_assembly(
+    results: dict[int, tuple[int, int, CornellSummaryStructured]],
+    *,
+    partial_md_path: Path | None,
+    h1_title: str,
+) -> None:
+    """Vuelca el ensamblaje de las ventanas completadas hasta ahora.
+
+    Pensado para llamar desde el handler de excepciones; nunca lanza.
+    """
+    if partial_md_path is None or not results:
+        return
+    try:
+        ordered_so_far = [results[i] for i in sorted(results.keys())]
+        partial_md = assemble_cornell_windows_markdown(
+            ordered_so_far, h1_title=h1_title
+        )
+        if partial_md.strip():
+            from summarizer.fs import atomic_write_text
+
+            atomic_write_text(partial_md_path, partial_md)
+            progress_log(
+                f"Resumen parcial escrito ({len(results)} ventanas): {partial_md_path}"
+            )
+    except Exception as ex:
+        progress_log(f"Aviso: no se pudo escribir resumen parcial: {ex}")
+
+
+def _effective_cornell_system_prompt() -> str:
+    """Mensaje system Cornell, con sufijo de profundidad si aplica."""
     if cornell_depth_profile() == "high":
-        return f"{SUMMARY_CORNELL_USER_PREFIX}\n\n{CORNELL_DEPTH_HIGH_SUFFIX}"
-    return SUMMARY_CORNELL_USER_PREFIX
+        return f"{SUMMARY_CORNELL_SYSTEM_PROMPT}\n\n{CORNELL_DEPTH_HIGH_SUFFIX}"
+    return SUMMARY_CORNELL_SYSTEM_PROMPT
 
 
 def _topic_sections_from_assembled_markdown(md: str) -> list[str]:
@@ -160,7 +191,9 @@ def _chunk_single_page_if_needed(
     pnum: int, ptext: str, *, safety_margin: int = 200
 ) -> list[tuple[int, int, str]]:
     base_wrapper = SUMMARY_WINDOW_WRAPPER.format(start=pnum, end=pnum, body="")
-    base_tokens = count_tokens(f"{_effective_cornell_user_prefix()}\n\n{base_wrapper}")
+    base_tokens = count_tokens(_effective_cornell_system_prompt()) + count_tokens(
+        base_wrapper
+    )
     ratio = app_state.get_adaptive_prompt_ratio()
     max_prompt = max(512, int(app_state.MAX_CONTEXT_TOKENS * ratio))
     room = max(256, max_prompt - base_tokens - safety_margin)
@@ -174,8 +207,154 @@ def _chunk_single_page_if_needed(
     return out
 
 
-def _normalize_topic_title(title: str) -> str:
-    return " ".join(title.lower().split())
+_SPANISH_STOPWORDS = frozenset(
+    {
+        "el",
+        "la",
+        "los",
+        "las",
+        "un",
+        "una",
+        "unos",
+        "unas",
+        "de",
+        "del",
+        "al",
+        "a",
+        "en",
+        "y",
+        "o",
+        "u",
+        "que",
+        "por",
+        "para",
+        "con",
+        "sin",
+        "sobre",
+        "entre",
+        "su",
+        "sus",
+        "este",
+        "esta",
+        "estos",
+        "estas",
+        "ese",
+        "esa",
+        "esos",
+        "esas",
+        "aquel",
+        "aquella",
+        "es",
+        "ser",
+        "son",
+        "como",
+        "mas",
+        "menos",
+        "muy",
+        "se",
+        "lo",
+        "le",
+        "les",
+        "me",
+        "te",
+        "nos",
+        "os",
+    }
+)
+
+
+def _strip_accents(text: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)
+    )
+
+
+def _title_tokens(title: str) -> frozenset[str]:
+    """Tokens del título normalizado (minúsculas, sin acentos, sin stopwords)."""
+    title_norm = _strip_accents(title.lower())
+    return frozenset(
+        t
+        for t in re.findall(r"[a-z0-9]+", title_norm)
+        if len(t) > 2 and t not in _SPANISH_STOPWORDS
+    )
+
+
+def _topic_signature(title: str, notes: str = "") -> frozenset[str]:
+    """Firma extendida = tokens de título + bigramas del inicio de notas.
+
+    Sirve para detectar paráfrasis cuando el título por sí solo no comparte
+    suficientes tokens, pero el contenido de las notas converge.
+    """
+    title_set = _title_tokens(title)
+    note_head = _strip_accents(notes.lower()[:200])
+    note_tokens = re.findall(r"[a-z0-9]+", note_head)
+    shingles: set[str] = set()
+    for i in range(len(note_tokens) - 1):
+        shingles.add(f"{note_tokens[i]}|{note_tokens[i + 1]}")
+        if len(shingles) >= 16:
+            break
+    return frozenset(title_set | shingles)
+
+
+def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+    if not a and not b:
+        return 1.0
+    union = a | b
+    if not union:
+        return 0.0
+    return len(a & b) / len(union)
+
+
+def _topic_similarity(a_title: str, a_notes: str, b_title: str, b_notes: str) -> float:
+    """Similaridad combinada: máximo entre Jaccard de títulos y Jaccard de firmas.
+
+    El Jaccard de títulos es la señal principal (paráfrasis del mismo asunto);
+    el Jaccard de firmas completas atrapa casos con títulos divergentes pero
+    contenido convergente.
+    """
+    title_jac = _jaccard(_title_tokens(a_title), _title_tokens(b_title))
+    full_jac = _jaccard(
+        _topic_signature(a_title, a_notes), _topic_signature(b_title, b_notes)
+    )
+    return max(title_jac, full_jac)
+
+
+def _merge_notes(existing: str, new: str) -> str:
+    """Concatena notas evitando líneas literalmente repetidas."""
+    existing_norm = {line.strip() for line in existing.splitlines() if line.strip()}
+    add_lines: list[str] = []
+    for line in new.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped in existing_norm:
+            continue
+        add_lines.append(line)
+        existing_norm.add(stripped)
+    if not add_lines:
+        return existing
+    sep = "\n\n" if existing.strip() else ""
+    return existing.rstrip() + sep + "\n".join(add_lines)
+
+
+def _merge_topic_blocks(
+    existing: CornellTopicBlock, new: CornellTopicBlock
+) -> CornellTopicBlock:
+    """Fusiona dos temas: conserva título, une `cues` y `notes`."""
+    cues_out = list(existing.cues)
+    seen_cues = {c.strip().lower() for c in cues_out if c.strip()}
+    for c in new.cues:
+        cn = c.strip().lower()
+        if cn and cn not in seen_cues:
+            cues_out.append(c)
+            seen_cues.add(cn)
+    cues_out = cues_out[:10]
+    notes = _merge_notes(existing.notes, new.notes)
+    summary = existing.topic_summary or new.topic_summary
+    return CornellTopicBlock(
+        title=existing.title,
+        cues=cues_out,
+        notes=notes,
+        topic_summary=summary,
+    )
 
 
 def format_cornell_structured_with_index(
@@ -204,36 +383,66 @@ def assemble_cornell_windows_markdown(
     *,
     h1_title: str = "Resumen",
 ) -> str:
-    """Une ventanas en un único Markdown con índice; temas Cornell seguidos sin agrupar por rango de páginas."""
-    index_entries: list[tuple[str, str]] = []
-    topic_blocks: list[str] = []
-    global_i = 0
+    """Une ventanas en un único Markdown con índice y deduplicación semántica.
+
+    A diferencia del modo legacy (igualdad exacta de títulos), este flujo usa
+    similitud Jaccard sobre una firma del tema (título normalizado + shingles
+    de notas). Cuando se detecta un duplicado, se **fusiona** el contenido
+    (cues y notes) sobre el tema ya emitido para no perder detalle entre
+    ventanas solapadas.
+    """
+    threshold = SEMANTIC_DEDUP_THRESHOLD
     used_slugs: set[str] = set()
-    last_norm: str | None = None
-    seen_global: set[str] = set()
+    emitted: list[dict] = []
 
     for win_i, (_start_p, _end_p, structured) in enumerate(ordered):
         if not structured.topics:
             continue
         for t in structured.topics:
-            norm = _normalize_topic_title(t.title)
-            if ASSEMBLE_DEDUP_BORDER and last_norm is not None and norm == last_norm:
+            merged_into: dict | None = None
+
+            if ASSEMBLE_DEDUP_BORDER and emitted:
+                prev = emitted[-1]
+                if (
+                    _topic_similarity(
+                        t.title, t.notes, prev["topic"].title, prev["topic"].notes
+                    )
+                    >= threshold
+                ):
+                    merged_into = prev
+            if merged_into is None and ASSEMBLE_DEDUP_GLOBAL:
+                for state in emitted:
+                    if (
+                        _topic_similarity(
+                            t.title,
+                            t.notes,
+                            state["topic"].title,
+                            state["topic"].notes,
+                        )
+                        >= threshold
+                    ):
+                        merged_into = state
+                        break
+
+            if merged_into is not None:
+                merged_topic = _merge_topic_blocks(merged_into["topic"], t)
+                merged_into["topic"] = merged_topic
                 continue
-            if ASSEMBLE_DEDUP_GLOBAL and norm in seen_global:
-                continue
-            seen_global.add(norm)
-            last_norm = norm
-            global_i += 1
+
+            global_i = len(emitted) + 1
             slug = slugify_anchor(t.title, fallback=f"tema-{global_i}")
             if slug in used_slugs:
                 slug = f"{slug}-w{win_i}-t{global_i}"
             used_slugs.add(slug)
-            index_entries.append((t.title, slug))
-            topic_blocks.append(_format_cornell_topic_markdown(t, slug=slug))
+            emitted.append({"topic": t, "slug": slug})
 
-    if not index_entries:
+    if not emitted:
         return ""
 
+    index_entries = [(s["topic"].title, s["slug"]) for s in emitted]
+    topic_blocks = [
+        _format_cornell_topic_markdown(s["topic"], slug=s["slug"]) for s in emitted
+    ]
     index_lines = "\n".join(f"- [{title}](#{slug})" for title, slug in index_entries)
     body = "\n\n".join(topic_blocks)
     return f"# {h1_title}\n\n## Índice\n\n{index_lines}\n\n---\n\n{body}"
@@ -251,17 +460,18 @@ def _chat_cornell_window(
     *,
     chapter_outline: list[str] | None = None,
 ) -> CornellSummaryStructured:
-    wrapped = SUMMARY_WINDOW_WRAPPER.format(start=start_p, end=end_p, body=body)
-    user_content = f"{_effective_cornell_user_prefix()}\n\n{wrapped}"
+    user_content = SUMMARY_WINDOW_WRAPPER.format(start=start_p, end=end_p, body=body)
     if chapter_outline:
         outline_lines = "\n".join(f"- {c}" for c in chapter_outline)
         user_content += BOOK_CHAPTER_OUTLINE_PREFIX.format(outline_lines=outline_lines)
-    completion = chat_parse_with_retry(
+    return chat_structured_with_retry(
         model=app_state.completion_model,
-        messages=[{"role": "user", "content": user_content}],
+        messages=[
+            {"role": "system", "content": _effective_cornell_system_prompt()},
+            {"role": "user", "content": user_content},
+        ],
         response_format=CornellSummaryStructured,
     )
-    return completion_parsed_or_validate(completion, CornellSummaryStructured)
 
 
 def summarize_document_paged_windows(
@@ -269,8 +479,18 @@ def summarize_document_paged_windows(
     *,
     partials_dir: Path | None = None,
     h1_title: str = "Resumen",
+    partial_md_path: Path | None = None,
 ) -> tuple[str, str]:
-    """Resumen Cornell por ventanas. Devuelve (markdown_final, markdown_ensamblado_pre_unificación)."""
+    """Resumen Cornell por ventanas.
+
+    Devuelve ``(markdown_final, markdown_ensamblado_pre_unificación)``.
+
+    Si ``partial_md_path`` se indica y el proceso lanza una excepción tras
+    haber procesado algunas ventanas, se escribe un ensamblado parcial en
+    esa ruta antes de propagar la excepción (los checkpoints por ventana ya
+    permiten reanudar en el siguiente run; este Markdown es para inspección
+    del usuario y para señalizar 'incompleto').
+    """
     pages = split_markdown_by_page_headers(full_text)
     if not pages:
         return "", ""
@@ -396,23 +616,38 @@ def summarize_document_paged_windows(
     results: dict[int, tuple[int, int, CornellSummaryStructured]] = {}
     n_win = len(windows)
     workers = min(MAX_PARALLEL_WINDOW_SUMMARIES, max(1, n_win))
-    if workers <= 1 or n_win == 1:
-        for i, w in enumerate(windows):
-            check_stop_requested()
-            idx, triple = run_window(i, w)
-            results[idx] = triple
-    else:
-        progress_log(
-            f"Resumen de ventanas en paralelo ({workers} workers, {n_win} ventanas)."
-        )
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            future_map = {
-                pool.submit(run_window, i, w): i for i, w in enumerate(windows)
-            }
-            for fut in as_completed(future_map):
+    completed_count = 0
+
+    def _log_window_progress() -> None:
+        progress_log(f"Resumen ventana {completed_count}/{n_win}")
+
+    try:
+        if workers <= 1 or n_win == 1:
+            for i, w in enumerate(windows):
                 check_stop_requested()
-                task_i, triple = fut.result()
-                results[task_i] = triple
+                idx, triple = run_window(i, w)
+                results[idx] = triple
+                completed_count += 1
+                _log_window_progress()
+        else:
+            progress_log(
+                f"Resumen de ventanas en paralelo ({workers} workers, {n_win} ventanas)."
+            )
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                future_map = {
+                    pool.submit(run_window, i, w): i for i, w in enumerate(windows)
+                }
+                for fut in as_completed(future_map):
+                    check_stop_requested()
+                    task_i, triple = fut.result()
+                    results[task_i] = triple
+                    completed_count += 1
+                    _log_window_progress()
+    except BaseException:
+        _write_partial_assembly(
+            results, partial_md_path=partial_md_path, h1_title=h1_title
+        )
+        raise
 
     ordered_struct = [results[i] for i in range(n_win)]
     combined_md_path = (
@@ -491,6 +726,9 @@ def _hierarchical_unify_markdown(
     total_batches = len(batches)
     for bi, batch in enumerate(batches, start=1):
         check_stop_requested()
+        progress_log(
+            f"Unificación jerárquica nivel {depth + 1}: lote {bi}/{total_batches}"
+        )
         combined = "\n\n".join(batch)
         prompt = UNIFY_ASSEMBLED_CORNELL_BATCH_PROMPT.format(
             part=bi, total=total_batches, combined=combined
@@ -520,25 +758,154 @@ def _hierarchical_unify_markdown(
             "Unificación jerárquica: se detiene tras fusiones limitadas; "
             "resultado del último lote."
         )
-        final_try = _single_pass_unify_if_fits(
+        return _maybe_final_single_pass(
             next_md, h1_title=h1_title, max_budget=max_budget
         )
-        return final_try if final_try is not None else next_md
 
     unified_full = UNIFY_ASSEMBLED_CORNELL_PROMPT.format(combined=next_md)
     if count_tokens(unified_full) <= max_budget:
-        final_try = _single_pass_unify_if_fits(
+        return _maybe_final_single_pass(
             next_md, h1_title=h1_title, max_budget=max_budget
         )
-        return final_try if final_try is not None else next_md
 
     return _hierarchical_unify_markdown(
         next_md, h1_title=h1_title, max_budget=max_budget, depth=depth + 1
     )
 
 
+def _maybe_final_single_pass(md: str, *, h1_title: str, max_budget: int) -> str:
+    """Pasada final opcional sobre el Markdown ya unificado por lotes.
+
+    Sólo se ejecuta cuando ``SUMMARY_UNIFY_MODE == "aggressive"`` (lo cual
+    también aplica al flag legado ``SUMMARIZER_SUMMARY_FINAL_UNIFY_PASS``,
+    que en ``config.py`` se mapea a ese modo). En los demás modos esta
+    pasada comprimiría el resultado innecesariamente.
+    """
+    if SUMMARY_UNIFY_MODE != "aggressive":
+        return md
+    final_try = _single_pass_unify_if_fits(md, h1_title=h1_title, max_budget=max_budget)
+    return final_try if final_try is not None else md
+
+
+_TOPIC_HEADING_RE = re.compile(r"^###\s+(.+?)\s*(?:\{#[^}]+\})?\s*$")
+_SECTION_HEADER_RE = re.compile(r"(?m)^####\s+")
+
+
+def _parse_topic_section(section: str) -> CornellTopicBlock | None:
+    """Reconstruye un ``CornellTopicBlock`` desde un bloque ensamblado.
+
+    Espera el formato emitido por :func:`_format_cornell_topic_markdown`:
+    título `### ... {#slug}` seguido de las sub-secciones `#### Pistas`,
+    `#### Notas`, `#### Resumen del tema`. Devuelve ``None`` si el bloque
+    no parsea (p. ej. heading vacío).
+    """
+    section = section.strip()
+    if not section:
+        return None
+    lines = section.splitlines()
+    title_match = _TOPIC_HEADING_RE.match(lines[0])
+    if not title_match:
+        return None
+    title = title_match.group(1).strip()
+    if not title:
+        return None
+    body = "\n".join(lines[1:])
+    cues: list[str] = []
+    notes = ""
+    topic_summary = ""
+    parts = _SECTION_HEADER_RE.split(body)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        header, _, content = part.partition("\n")
+        header_norm = _strip_accents(header.strip().lower())
+        content = content.strip()
+        if header_norm.startswith("pistas") or header_norm.startswith("cue"):
+            cues = [
+                line.lstrip("-* ").strip()
+                for line in content.splitlines()
+                if line.lstrip("-* ").strip() and line.lstrip("-* ").strip() != "-"
+            ]
+        elif header_norm.startswith("notas") or header_norm == "notes":
+            notes = content
+        elif header_norm.startswith("resumen") or header_norm.startswith("summary"):
+            topic_summary = content
+    return CornellTopicBlock(
+        title=title,
+        cues=cues,
+        notes=notes,
+        topic_summary=topic_summary,
+    )
+
+
+def _lmless_second_pass(md: str, *, h1_title: str) -> str:
+    """Aplica una segunda pasada de dedup Jaccard sobre el ensamblaje.
+
+    No realiza llamadas LLM: parsea los bloques ``###`` del Markdown
+    ensamblado, fusiona los temas con similitud Jaccard ≥ umbral relajado
+    (``SEMANTIC_DEDUP_THRESHOLD - 0.1``) y re-emite el Markdown final.
+    Pensado para preservar el máximo detalle, aceptando algunos duplicados
+    blandos (sinónimos exactos que Jaccard no detecta).
+    """
+    sections = _topic_sections_from_assembled_markdown(md)
+    if len(sections) <= 1:
+        return md
+    parsed: list[CornellTopicBlock] = []
+    for section in sections:
+        block = _parse_topic_section(section)
+        if block is not None:
+            parsed.append(block)
+    if len(parsed) <= 1:
+        return md
+    threshold = max(0.1, SEMANTIC_DEDUP_THRESHOLD - 0.1)
+    merged: list[CornellTopicBlock] = []
+    for t in parsed:
+        match_idx = -1
+        for i, existing in enumerate(merged):
+            if (
+                _topic_similarity(t.title, t.notes, existing.title, existing.notes)
+                >= threshold
+            ):
+                match_idx = i
+                break
+        if match_idx >= 0:
+            merged[match_idx] = _merge_topic_blocks(merged[match_idx], t)
+        else:
+            merged.append(t)
+    progress_log(
+        f"Unificación LM-less: {len(parsed)} bloques → {len(merged)} tras "
+        f"Jaccard (umbral {threshold:.2f})."
+    )
+    if not merged:
+        return md
+    return format_cornell_structured_with_index(
+        CornellSummaryStructured(topics=merged), h1_title=h1_title
+    )
+
+
 def _try_unify_assembled(md: str, *, h1_title: str = "Resumen") -> str:
-    """Fusiona duplicados y coherencia (un paso y/o por lotes según tamaño y flags)."""
+    """Aplica el modo de unificación seleccionado tras el ensamblaje.
+
+    Modos (controlados por ``SUMMARIZER_SUMMARY_UNIFY_MODE``):
+
+    - ``none``: devuelve el Markdown ensamblado sin tocar.
+    - ``lmless``: segunda pasada Jaccard, cero llamadas LLM extra.
+    - ``hierarchical`` (default): unificación por lotes con LLM.
+    - ``aggressive``: hierarchical + pasada final single-pass LLM.
+    """
+    mode = SUMMARY_UNIFY_MODE
+    progress_log(f"Modo de unificación: {mode}")
+
+    if mode == "none":
+        return md
+    if mode == "lmless":
+        try:
+            return _lmless_second_pass(md, h1_title=h1_title)
+        except Exception as ex:
+            progress_log(f"Unificación LM-less fallida (se conserva ensamblaje): {ex}")
+            return md
+
     try:
         ratio = app_state.get_adaptive_prompt_ratio()
         max_budget = max(512, int(app_state.MAX_CONTEXT_TOKENS * ratio))
@@ -566,16 +933,18 @@ def _try_unify_assembled(md: str, *, h1_title: str = "Resumen") -> str:
 
 
 def _chat_cornell_structured(user_content: str) -> CornellSummaryStructured:
-    completion = chat_parse_with_retry(
+    return chat_structured_with_retry(
         model=app_state.completion_model,
-        messages=[{"role": "user", "content": user_content}],
+        messages=[
+            {"role": "system", "content": _effective_cornell_system_prompt()},
+            {"role": "user", "content": user_content},
+        ],
         response_format=CornellSummaryStructured,
     )
-    return completion_parsed_or_validate(completion, CornellSummaryStructured)
 
 
 def summarize_cornell_single(full_text: str, *, h1_title: str = "Resumen") -> str:
-    user_content = f"{_effective_cornell_user_prefix()}\n\n---\n\n{full_text}"
+    user_content = f"---\n\n{full_text}"
     return format_cornell_markdown(
         _chat_cornell_structured(user_content), h1_title=h1_title
     )
@@ -583,9 +952,8 @@ def summarize_cornell_single(full_text: str, *, h1_title: str = "Resumen") -> st
 
 def _summarize_one_chunk(part: int, total: int, body: str) -> tuple[int, str]:
     wrapped = SUMMARY_CHUNK_WRAPPER.format(part=part, total=total, body=body)
-    user_content = f"{_effective_cornell_user_prefix()}\n\n{wrapped}"
     md = format_cornell_markdown(
-        _chat_cornell_structured(user_content), document_title=False
+        _chat_cornell_structured(wrapped), document_title=False
     )
     return part, md
 
@@ -626,8 +994,10 @@ def summarize_cornell_chunked(
 
 def summarize_document(full_text: str, *, h1_title: str = "Resumen") -> str:
     check_stop_requested()
-    single_user = f"{_effective_cornell_user_prefix()}\n\n---\n\n{full_text}"
-    prompt_tokens = count_tokens(single_user)
+    single_user = f"---\n\n{full_text}"
+    prompt_tokens = count_tokens(_effective_cornell_system_prompt()) + count_tokens(
+        single_user
+    )
     current_ratio = app_state.get_adaptive_prompt_ratio()
     effective_input_budget = max(512, int(app_state.MAX_CONTEXT_TOKENS * current_ratio))
     progress_log(

@@ -1,4 +1,11 @@
-"""Plantillas de prompt para OCR y resúmenes."""
+"""Plantillas de prompt para OCR y resúmenes Cornell.
+
+Separamos el contenido en (a) un prompt de **sistema** estable que se envía
+una vez por llamada (y que LM Studio/llama.cpp puede cachear como prefijo
+entre slots), y (b) prompts de **usuario** específicos por tarea (ventana,
+fragmento, unificación). Esto reduce significativamente los tokens
+repetidos cuando se resumen libros largos por ventanas.
+"""
 
 OCR_PROMPT = """Rol: transcriptor OCR de documentos académicos.
 Tarea: rellena únicamente el campo del esquema con el texto de la imagen.
@@ -9,47 +16,55 @@ Reglas:
 - No inventes texto donde no haya; usa [ilegible] en huecos.
 - Idioma: el mismo que aparece en la página."""
 
-SUMMARY_CORNELL_USER_PREFIX = """Rol: tutor de estudio y redactor de apuntes académicos en español (nivel universitario).
-Salida: cumple EXACTAMENTE el esquema JSON indicado (solo claves permitidas; lista `topics` con objetos title, cues, notes, topic_summary).
 
-Instrucciones:
-1. Tras el separador --- está el documento fuente. Particiona y resume por la estructura discursiva del autor: capítulos, secciones, subtítulos, apartados numerados o temáticas claras (incluidas en encabezados Markdown del propio texto o en negritas/títulos implícitos). Los marcadores `## Página N` solo delimitan el contenido disponible, no son títulos de salida.
-2. En `topics`, ordena los elementos en el mismo orden en que aparecen esas secciones/temáticas en el fragmento. Si la misma sección continúa en varias páginas del bloque, unifica en un único topic.
-3. Por tema, respeta este reparto (no acortes todo en `topic_summary`):
-   - `title`: refleja la sección o temática; nunca números de página, rangos "páginas X–Y", "Pág." ni metadatos de fragmento.
-   - `cues`: solo pistas breves de repaso (palabras clave o preguntas cortas); 3 a 10 ítems según densidad.
-   - `notes`: AQUÍ va el contenido de estudio principal. Debe ser sustancial y utilizable como material de repaso serio: varios párrafos cortos (puedes separarlos con líneas en blanco dentro del string JSON) y/o líneas que empiecen con "- " para listar puntos. Incluye, cuando el original las tenga: definiciones formales o informales, hipótesis, notación, fórmulas (LaTeX ligero con $...$ si aplica), pasos de procedimientos o algoritmos, condiciones de aplicación, casos particulares, relaciones entre conceptos, advertencias o límites del modelo. Parafrasea y condensa sin vaciar el contenido: evita una sola frase telegráfica si el texto ofrece más matices.
-   - `topic_summary`: cierre breve (2 a 5 frases) que integre idea central y utilidad; no dupliques todo lo ya dicho en `notes`, pero puede remarcar el hilo conductor.
-4. Prioriza rigor: hechos, definiciones, datos y razonamiento del texto; no inventes citas, referencias ni detalles inexistentes en el material.
-5. Si el documento mezcla idiomas, sintetiza en español salvo nombres propios o términos técnicos estándar.
-6. No incluyas texto fuera del JSON (sin markdown envolvente, sin comentarios).
-7. No crees temas "meta" que solo repitan el título del libro o del documento sin contenido sustantivo (definiciones, hechos o argumentos del texto). Si un bloque no aporta más que una frase genérica, no lo incluyas como topic separado.
-8. Evita duplicar el mismo capítulo o temática con títulos casi idénticos (p. ej. título del libro y "título del libro: origen"); unifica en un solo topic cuando sea el mismo asunto."""
+SUMMARY_CORNELL_SYSTEM_PROMPT = """Rol: tutor de estudio y redactor de apuntes académicos en español (nivel universitario) estilo Cornell.
 
-CORNELL_DEPTH_HIGH_SUFFIX = """Instrucciones adicionales (perfil de profundidad alta):
-- Cuando el fragmento tenga varias ideas o secciones claramente distintas, prefiere varios `topics` (uno por subapartado o argumento principal) en lugar de un solo tema monolítico.
-- En `notes`, usa párrafos o viñetas numeradas para subpasos; si hay listas o enumeraciones en el original, refleja esa granularidad.
-- No reduzcas varias definiciones o ejemplos distintos a una sola frase si cada uno aporta matices distintos para el estudio."""
+Esquema y campos por tema:
+- `title`: refleja la sección o temática del autor. NO uses números de página, rangos ("páginas X–Y"), "Pág.", "Fragmento", ni metadatos.
+- `cues`: 3 a 10 palabras clave o preguntas cortas de repaso (una idea por elemento).
+- `notes`: cuerpo de estudio principal y el campo MÁS EXTENSO del tema. Varios párrafos cortos (separados por líneas en blanco dentro del string JSON) y/o viñetas con "- ". Incluye, cuando el original lo tenga: definiciones, hipótesis, notación, fórmulas, pasos de procedimientos/algoritmos, condiciones de aplicación, casos particulares, relaciones entre conceptos y advertencias. Parafrasea y condensa sin vaciar el contenido.
+- `topic_summary`: cierre de 2 a 5 frases con la idea central y utilidad. No dupliques todo lo de `notes`; remarca el hilo conductor.
 
-SUMMARY_CHUNK_WRAPPER = """Contexto: este bloque es el fragmento {part} de {total} de un documento largo (no tienes el resto).
+Estructura del resumen:
+- Particiona por la estructura discursiva del autor (capítulos, secciones, subtítulos, apartados numerados o temáticas claras). Los marcadores `## Página N` son sólo delimitadores de contexto: NO son títulos de salida.
+- Si la misma sección se reparte en varias páginas o bloques, unifícala en un único `topic`.
+- Orden de `topics`: el mismo orden de aparición en el fragmento.
+- No crees temas "meta" (que solo repitan el título del libro sin contenido sustantivo).
+- Evita duplicar la misma temática con títulos casi idénticos: unifica.
+
+Idioma y rigor:
+- Sintetiza en español. Mantén nombres propios y términos técnicos estándar.
+- No inventes citas, referencias ni datos ausentes en el material.
+
+Fórmulas y matemáticas:
+- Usa LaTeX entre `$...$` (inline) o `$$...$$` (bloque): `$\\\\frac{a}{b}$`, `$\\\\sqrt{x^2}$`, `$10\\\\,\\\\text{m/s}^2$`.
+- CRÍTICO: en JSON los backslashes de LaTeX deben ir DOBLES (`\\\\text`, `\\\\frac`). Si no puedes garantizar el doble escape, prefiere Unicode (`m/s²`, `·`, `π`, `≈`, `≤`, `≥`, super/subíndices Unicode).
+- Mantén cada fórmula en una sola línea dentro de su span `$...$` (sin saltos de línea).
+
+Salida: SOLO el JSON del esquema, en español, sin Markdown envolvente ni comentarios."""
+
+CORNELL_DEPTH_HIGH_SUFFIX = """Perfil de profundidad alta:
+- Prefiere varios `topics` (uno por subapartado o argumento) sobre un tema monolítico.
+- Granularidad fina en `notes`: cada definición, ejemplo o caso en su propia viñeta/párrafo; refleja la granularidad del original.
+- No reduzcas varias definiciones o ejemplos distintos a una sola frase si cada uno aporta matices."""
+
+SUMMARY_CHUNK_WRAPPER = """Contexto: fragmento {part} de {total} de un documento largo (no tienes el resto).
 
 Qué hacer:
-- Extrae solo los temas que se apoyen en el contenido de ESTE fragmento.
-- En cada tema, `notes` debe ser el campo más extenso y detallado (material de estudio), no un resumen de una línea.
-- Si un tema empieza aquí y seguramente sigue después, en `notes` indica al final: (continúa en el siguiente fragmento).
+- Extrae sólo los temas apoyados en ESTE fragmento.
+- En cada tema, `notes` es el campo más extenso; no una frase telegráfica.
+- Si un tema empieza aquí y seguramente sigue después, indica al final de `notes`: (continúa en el siguiente fragmento).
 - No inventes contenido de otras partes del documento.
 
 ---
 {body}"""
 
-SUMMARY_WINDOW_WRAPPER = """Contexto: el bloque siguiente contiene el texto de las secciones {start}–{end} del documento fuente, separadas por marcadores `## Página N`. Esos marcadores son solo delimitación de contexto (no repitas ni uses esos rangos o números en los campos `title` del JSON).
+SUMMARY_WINDOW_WRAPPER = """Contexto: secciones {start}–{end} del documento, delimitadas por marcadores `## Página N`. Esos marcadores son sólo contexto (NO los uses como `title` ni cites rangos de página).
 
 Qué hacer:
-- Extrae `topics` siguiendo títulos, subtítulos, secciones y temáticas del propio contenido (no una lista por sección).
-- Si la misma sección continúa en varios bloques dentro de este fragmento, unifica en un solo `topic` con un único `title` y acumula el detalle en `notes` (un solo bloque de notas rico, no varias versiones sucesivas telegráficas).
-- En cada tema, desarrolla `notes` con el mismo nivel de detalle que exigirías en apuntes para un examen: definiciones, fórmulas, pasos y matices presentes en estas secciones (sin inventar).
-- Si el texto está en otro idioma, sintetiza en español salvo nombres propios y términos técnicos habituales.
-- Evita duplicar el mismo tema cerrado solo porque cambia el marcador de sección; en solape con otra ventana, prioriza información nueva sin repetir el mismo `title` si el contenido es redundante.
+- Extrae `topics` siguiendo títulos, subtítulos, secciones y temáticas del contenido.
+- Si la misma sección continúa en varios bloques de este fragmento, unifica en un solo `topic` con `title` único y `notes` consolidado.
+- En solape con otra ventana, prioriza información nueva; no repitas el mismo `title` si el contenido es redundante.
 
 ---
 {body}"""
@@ -61,50 +76,47 @@ Capítulos:
 {outline_lines}
 """
 
-UNIFY_ASSEMBLED_CORNELL_PROMPT = """Rol: editor académico de apuntes estilo Cornell (documento para estudio serio).
+UNIFY_ASSEMBLED_CORNELL_PROMPT = """Tarea: fusión final de un resumen Cornell ya generado en Markdown.
 
-Recibes el Markdown completo de un resumen ya generado: incluye `## Índice` con enlaces y bloques `###` con Pistas, Notas y Resumen del tema. Puede haber temas duplicados o solapados, títulos redundantes, o secciones triviales/meta sin sustancia.
+Recibes tras --- el Markdown completo (con `## Índice` y bloques `### tema` que contienen Pistas, Notas y Resumen del tema). Puede haber temas duplicados, solapados o triviales.
 
-Objetivo: devuelve UN ÚNICO JSON con el esquema habitual: lista `topics` donde cada elemento tiene title, cues, notes, topic_summary.
+Devuelve UN JSON del esquema con la lista `topics` consolidada.
 
 Reglas:
-1. Fusiona temas que traten el mismo asunto (títulos similares o contenido redundante). Al fusionar, une el contenido de las notas en un solo texto `notes` más completo: conserva definiciones, fórmulas, pasos y matices de todas las entradas fusionadas; elimina solo repeticiones literales obvias. No sustituyas párrafos de notas por una frase más corta si eso pierde información útil.
-2. Si algún bloque tiene `notes` demasiado escueto (una o dos frases genéricas) pero las `Pistas` o el `Resumen del tema` sugieren más sustancia, reescribe `notes` para que sea el cuerpo de estudio principal (sin inventar datos que no estén en el material recibido).
-3. Elimina temas triviales: solo dicen que el autor es conocido, repiten el título del libro sin contenido nuevo, o son frases genéricas sin datos del texto.
-4. Ordena los temas en secuencia lógica coherente con el documento (orden de exposición del autor, no orden aleatorio).
-5. Mantén rigor: no inventes hechos. `notes` debe seguir siendo el campo más detallado de cada tema; `topic_summary` solo cierra en pocas frases.
-6. Salida: solo JSON, en español, sin markdown fuera del JSON.
+1. Fusiona temas con el mismo asunto. Al fusionar, ENRIQUECE `notes` uniendo definiciones, fórmulas, pasos y matices; elimina sólo repeticiones literales obvias. NO sustituyas párrafos de notas por una frase corta si eso pierde información.
+2. Si un `notes` es escueto pero las `Pistas` o `Resumen` sugieren más sustancia, reescribe `notes` con ese contenido (sin inventar).
+3. Elimina temas triviales: frases genéricas, "el autor es conocido", repeticiones del título del libro sin contenido.
+4. Orden lógico coherente con la exposición del autor.
+5. Mantén rigor: sin invenciones. `notes` sigue siendo el campo más detallado.
 
 ---
 {combined}
 """
 
-UNIFY_ASSEMBLED_CORNELL_BATCH_PROMPT = """Rol: editor académico de apuntes estilo Cornell (lote parcial de un documento largo).
+UNIFY_ASSEMBLED_CORNELL_BATCH_PROMPT = """Tarea: lote parcial de fusión Cornell.
 
-Este es el LOTE {part} de {total} de un resumen ya generado en Markdown (bloques `###` con Pistas, Notas y Resumen del tema). Otros lotes existen antes y después; NO inventes contenido que no aparezca aquí.
+Este es el LOTE {part} de {total} del resumen (bloques `### tema`). Otros lotes existen antes/después; NO inventes contenido externo.
 
-Objetivo: devuelve UN ÚNICO JSON (esquema `topics`: title, cues, notes, topic_summary) que cubra solo este lote.
+Devuelve UN JSON del esquema cubriendo SÓLO este lote.
 
 Reglas:
-1. Fusiona dentro de este lote los temas que traten exactamente el mismo asunto (títulos casi idénticos o notas redundantes). Al fusionar, concatena y enriquece `notes`: conserva definiciones, fórmulas, pasos y matices; elimina solo repeticiones literales obvias. No acortes `notes` a frases telegráficas si el material del lote aporta más detalle.
-2. No elimines temas distintos solo por ahorrar espacio: si son asuntos diferentes, mantén `topics` separados.
-3. Ordena los temas en el orden de aparición en este lote.
-4. Salida: solo JSON, en español, sin markdown fuera del JSON.
+1. Fusiona dentro de este lote temas con el mismo asunto. Concatena y enriquece `notes` (definiciones, fórmulas, pasos); elimina sólo repeticiones literales obvias.
+2. No descartes temas distintos por ahorrar espacio.
+3. Orden de aparición en este lote.
 
 ---
 {combined}
 """
 
-UNIFY_SUMMARIES_PROMPT = """Rol: editor de apuntes académicos. Recibes varios resúmenes parciales del MISMO documento (Markdown) tras ---.
+UNIFY_SUMMARIES_PROMPT = """Tarea: unifica varios resúmenes parciales del MISMO documento (Markdown, tras ---).
 
-Objetivo: producir un único JSON del esquema con una lista `topics` coherente para todo el documento.
+Devuelve UN JSON del esquema con la lista `topics` coherente para todo el documento.
 
 Reglas:
-1. Fusiona temas duplicados o muy similares. Integra `notes` en un solo texto enriquecido (definiciones, fórmulas, pasos): quita redundancia pero no comprimas hasta dejar notas telegráficas.
-2. Ordena los temas en secuencia lógica (orden del libro o del razonamiento, no orden de fragmentos).
-3. Mantén el estilo Cornell (title, cues, notes, topic_summary): `notes` sigue siendo el bloque más extenso y detallado por tema.
+1. Fusiona temas duplicados o similares. Integra `notes` enriqueciéndolas; no comprimas a líneas telegráficas.
+2. Orden lógico (orden del libro o del razonamiento, no orden de fragmentos).
+3. Estilo Cornell: `notes` es el bloque más extenso y detallado.
 4. Elimina contradicciones; prioriza consistencia.
-5. Salida: solo el JSON del esquema, en español.
 
 ---
 {combined}"""
